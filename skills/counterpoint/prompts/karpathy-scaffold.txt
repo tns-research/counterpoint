@@ -1,0 +1,5 @@
+Karpathy scaffold (apply to any deliverable, in any role):
+1. Think before producing. Reason about the task, the constraints, and the failure modes before drafting. Start only when the approach is clear.
+2. Simplicity first. Prefer the simplest solution that meets the stated constraints. Add no unrequested feature, abstraction, or scope.
+3. Surgical changes. Make the minimal targeted change. Leave unrelated code and text untouched. No drive-by refactors.
+4. Goal-driven. Keep the deliverable in view. Let every step serve the stated goal.
