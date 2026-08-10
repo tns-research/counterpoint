@@ -54,13 +54,46 @@ echo small > "$work/mode"
 printf 'do a task' | bash "$ENTRY" >/dev/null 2>&1
 ok "toggle small + no run blocks the stop" "$(run_stop)" 2
 
-# ...and clears once the run artifacts for this turn exist.
+# A run whose Codex call failed writes its artifacts but no `ok` marker, and
+# leaves critique.txt empty. That used to satisfy the gate: the hook proved a
+# file existed, not that anything had audited the draft. It must still block.
 tid="$(cat "$work/current-turn")"
 mkdir -p "$work/runs/r1"
 echo "$tid" > "$work/runs/r1/turn_id"
 : > "$work/runs/r1/log.txt"
+: > "$work/runs/r1/critique.txt"
+echo "shipped" > "$work/runs/r1/result.md"
+ok "failed critique (no ok marker) still blocks the stop" "$(run_stop)" 2
+
+# Marked ok but the critique file is empty: still not an audit.
+: > "$work/runs/r1/ok"
+ok "ok marker with an empty critique still blocks" "$(run_stop)" 2
+
+# A real critique, but result.md is empty: the deliver phase did not land.
+echo "the critique" > "$work/runs/r1/critique.txt"
 : > "$work/runs/r1/result.md"
-ok "toggle small + artifacts allows the stop" "$(run_stop)" 0
+ok "empty result.md still blocks the stop" "$(run_stop)" 2
+
+# ...and clears once the run artifacts for this turn are complete and successful.
+echo "shipped" > "$work/runs/r1/result.md"
+ok "toggle small + successful artifacts allows the stop" "$(run_stop)" 0
+
+# Full mode needs the two plan phases too, and they are held to the same bar.
+reset
+echo full > "$work/mode"
+printf 'do a task' | bash "$ENTRY" >/dev/null 2>&1
+tid="$(cat "$work/current-turn")"
+mkdir -p "$work/runs/f1"
+echo "$tid" > "$work/runs/f1/turn_id"
+: > "$work/runs/f1/log.txt"; : > "$work/runs/f1/ok"
+echo "c" > "$work/runs/f1/critique.txt"; echo "r" > "$work/runs/f1/result.md"
+ok "full without the plan phases blocks" "$(run_stop)" 2
+mkdir -p "$work/runs/f2" "$work/runs/f3"
+echo "$tid" > "$work/runs/f2/turn_id"; echo "plan" > "$work/runs/f2/plan_codex.txt"
+echo "$tid" > "$work/runs/f3/turn_id"; echo "review" > "$work/runs/f3/plan_review.txt"
+ok "full with unmarked plan phases still blocks" "$(run_stop)" 2
+: > "$work/runs/f2/ok"; : > "$work/runs/f3/ok"
+ok "full with successful plan phases allows the stop" "$(run_stop)" 0
 
 # Toggle off with nothing armed: dormant, ordinary single-model turn.
 reset

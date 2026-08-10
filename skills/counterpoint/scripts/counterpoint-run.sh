@@ -38,12 +38,21 @@
 # Prints the critique, the verifier verdict, the role-log block, and the run-dir
 # path on stdout. Exit 0 on a completed audit (even if the verifier failed: a
 # failing verifier is a result the orchestrator must act on, not a script error).
+#
+# Every Codex call here is bounded by COUNTERPOINT_CODEX_TIMEOUT (default 600s)
+# and retried once on a transient failure, and an empty final message counts as a
+# failure. A run that did not get a usable critique writes no `ok` marker: it is
+# not counted as a mini-loop round, the Stop hook keeps refusing to end the turn,
+# and stdout says so plainly. On code tasks `codex exec review` runs in parallel
+# with the critique instead of after it.
 set -euo pipefail
 
 home="${COUNTERPOINT_HOME:-$HOME/.counterpoint}"
 skill_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 consult="$skill_dir/scripts/codex-consult.sh"
 scaffold="$skill_dir/prompts/karpathy-scaffold.txt"
+# shellcheck source=./counterpoint-lib.sh
+. "$skill_dir/scripts/counterpoint-lib.sh"
 
 mode=""
 task=""
@@ -108,24 +117,21 @@ case "$finalizer" in opus|codex) : ;; *) die "--finalizer must be opus or codex"
 [ -f "$scaffold" ] || die "scaffold not found: $scaffold"
 
 # Tie this run to the current turn (the UserPromptSubmit hook writes the marker).
-turn_id="manual"
-[ -f "$home/current-turn" ] && turn_id="$(tr -d '[:space:]' < "$home/current-turn")"
+turn_id="$(cp_turn_id "$home")"
 
-# Mini-loop round = how many runs already exist for this turn, plus one.
 runs_dir="$home/runs"
 mkdir -p "$runs_dir"
-round=1
-if [ "$turn_id" != "manual" ]; then
-  prior=0
-  for d in "$runs_dir"/*/; do
-    # A "round" is a completed critique run (it has log.txt). Plan-phase dirs
-    # written by counterpoint-plan.sh have no log.txt, so they never inflate the
-    # mini-loop count.
-    [ -f "${d}turn_id" ] && [ -f "${d}log.txt" ] || continue
-    [ "$(cat "${d}turn_id")" = "$turn_id" ] && prior=$((prior + 1))
-  done
-  round=$((prior + 1))
-fi
+cp_gc_runs "$runs_dir"
+
+# Mini-loop round = how many SUCCESSFUL critique runs already exist for this
+# turn, plus one. A round is a completed critique run: it has log.txt (plan-phase
+# dirs have none, so they never inflate the count) and the `ok` marker. Counting
+# only successful runs matters: a Codex call that timed out or came back empty
+# must not consume the single pass small mode is allowed, or a transient failure
+# would lock the turn out of its own retry while the Stop hook still demands a
+# critique.
+prior="$(cp_count_runs "$runs_dir" "$turn_id" log.txt)"
+round=$((prior + 1))
 # Small mode is strictly single-pass and never loops: one critique per turn, then
 # ship (SKILL.md step 6). Enforce it here so the bound cannot be narrated away --
 # a second critique run in small mode is refused and pointed at full mode, where
@@ -150,7 +156,7 @@ ctx="$run/context.txt"
   echo
   echo "</original_request>"
   echo
-  for r in "${resources[@]}"; do
+  for r in ${resources+"${resources[@]}"}; do
     if [ -f "$r" ]; then
       echo "<resource path=\"$r\">"
       cat "$r"
@@ -199,22 +205,65 @@ INSTR
 # Codex-review-Codex and defeat the whole loop.
 critique="$run/critique.txt"
 if [ "$critic" = "codex" ]; then
+  # --- code review: a second, model-diverse pass over the repo diff ---
+  # Started FIRST and in the background: it is independent of the critique over
+  # the parity context, so running the two back to back was serializing one to
+  # three minutes for nothing. Both are collected before the artifact is written.
+  #
+  # It also gets the same isolation as every other Codex call here. It used to be
+  # a bare `codex exec review` with the user config live, which is exactly the
+  # configuration that let an MCP web-search server hang the turn under a
+  # networkless sandbox, with stderr discarded so the failure was invisible.
+  review_pid=""
+  review_out="$run/code_review.txt"
+  if [ "$is_code" = "1" ]; then
+    echo ">>> counterpoint: running codex exec review (parallel) ..." >&2
+    cfg_model="$(cp_cfg_value model)"
+    cfg_reasoning="$(cp_cfg_value model_reasoning_effort)"
+    review_effort="$(cp_effort_min "${COUNTERPOINT_CRITIQUE_EFFORT:-$cfg_reasoning}" "$cfg_reasoning")"
+    (
+      # Flags verified against codex-cli 0.144: `review` is its own subcommand
+      # with its own parser. It rejects --color ("unexpected argument"), which
+      # the previous call site passed, so this pass had been failing outright
+      # and the failure was swallowed by `2>/dev/null || echo "(unavailable)"`.
+      # It also requires an explicit target; --uncommitted is the producer's
+      # working diff, which is what the critique is about.
+      rargs=(exec review --uncommitted --skip-git-repo-check --ignore-user-config -o "$review_out")
+      # Same gVisor caveat as the producer write path: `review` shells out to git
+      # to read the diff, and Codex's bubblewrap sandbox cannot start there, so
+      # the pass comes back saying it "could not inspect the repository diff"
+      # while still exiting 0. With the outer sandbox providing the isolation,
+      # the bypass is what makes this pass actually see the change.
+      [ "${COUNTERPOINT_CODEX_BYPASS_SANDBOX:-0}" = "1" ] && rargs+=(--dangerously-bypass-approvals-and-sandbox)
+      [ -n "$cfg_model" ] && rargs+=(-c "model=\"$cfg_model\"")
+      [ -n "$review_effort" ] && rargs+=(-c "model_reasoning_effort=\"$review_effort\"")
+      cp_codex_exec "$review_out" -- "${rargs[@]}"
+    ) >>"$run/code_review.stderr" 2>&1 &
+    review_pid=$!
+  fi
+
   echo ">>> counterpoint: running Codex critique (read-only) ..." >&2
-  if "$consult" < "$ctx" > "$critique" 2>>"$run/critique.stderr"; then
+  critique_effort_args=()
+  [ -n "${COUNTERPOINT_CRITIQUE_EFFORT:-}" ] && critique_effort_args=(-e "$COUNTERPOINT_CRITIQUE_EFFORT")
+  if "$consult" ${critique_effort_args+"${critique_effort_args[@]}"} < "$ctx" > "$critique" 2>>"$run/critique.stderr"; then
     critique_ok=1
   else
     critique_ok=0
     echo "(codex critique call failed; see critique.stderr)" >> "$critique"
   fi
 
-  # --- code review: a second, model-diverse pass over the repo diff ---
-  if [ "$is_code" = "1" ]; then
-    echo ">>> counterpoint: running codex exec review ..." >&2
+  if [ -n "$review_pid" ]; then
+    review_rc=0
+    wait "$review_pid" || review_rc=$?
     {
       echo
       echo "=== codex exec review ==="
-      codex exec review --skip-git-repo-check --color never 2>/dev/null || echo "(codex exec review unavailable)"
-    } >> "$critique" || true
+      if [ "$review_rc" = 0 ] && [ -s "$review_out" ]; then
+        cat "$review_out"
+      else
+        echo "(codex exec review failed with exit $review_rc; see code_review.stderr)"
+      fi
+    } >> "$critique"
   fi
 else
   # critic=opus: Codex produced this draft. The cross-model critic is the live
@@ -255,7 +304,15 @@ if [ -n "$verifier" ]; then arbiter_rung="hard-verifier"; else arbiter_rung="con
 # counterpoint-finalize.sh once the producer has revised from the critique (F5).
 cp "$draft" "$run/draft.md"
 
-jstr() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n'; }
+# The success marker. The Stop hook and the round counter both key off this
+# rather than off the mere existence of log.txt: an empty or failed critique used
+# to write log.txt all the same, so the enforcement layer proved a file had been
+# created and nothing about whether the audit happened.
+if [ "$critique_ok" = 1 ] && [ -s "$critique" ]; then
+  : > "$run/ok"
+fi
+
+jstr() { cp_jstr "$1"; }
 {
   echo "{"
   echo "  \"ts\": \"$(jstr "$ts")\","
@@ -296,6 +353,12 @@ log="$run/log.txt"
 # --- report to the orchestrator on stdout ---
 echo "=== counterpoint run: $run ==="
 echo
+if [ ! -f "$run/ok" ]; then
+  echo "!!! CRITIQUE FAILED: no usable critique came back (see critique.stderr)."
+  echo "!!! This run is NOT counted as a round, so re-run the same command to retry."
+  echo "!!! Do not ship as if the loop had audited the draft."
+  echo
+fi
 echo "--- critique ---"
 cat "$critique"
 echo

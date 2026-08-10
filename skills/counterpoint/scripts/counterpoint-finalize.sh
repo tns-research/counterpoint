@@ -47,25 +47,30 @@ done
 [ -f "$final" ] || die "final deliverable not found: $final"
 [ -n "$caught" ] || die "--caught is required (one line: what the critique changed, or \"nothing, draft held\")"
 
-# Resolve the run dir. If not given, find the latest critique run (has log.txt)
-# tied to the current turn, so the finalizer does not have to track the timestamp.
+# Resolve the run dir. If not given, find the latest SUCCESSFUL critique run (it
+# has log.txt and the `ok` marker) tied to the current turn, so the finalizer does
+# not have to track the timestamp. Skipping failed runs matters: attaching
+# result.md to a run whose critique timed out would leave the turn looking
+# finalized while nothing had audited the draft.
 if [ -z "$run" ]; then
   [ -f "$home/current-turn" ] || die "no --run given and no current-turn marker to resolve it from"
   turn_id="$(tr -d '[:space:]' < "$home/current-turn")"
   latest=""
   if [ -d "$home/runs" ]; then
     for d in "$home/runs"/*/; do
-      [ -f "${d}turn_id" ] && [ -f "${d}log.txt" ] || continue
+      [ -f "${d}turn_id" ] && [ -f "${d}log.txt" ] && [ -f "${d}ok" ] || continue
       [ "$(cat "${d}turn_id")" = "$turn_id" ] || continue
       latest="$d"
     done
   fi
-  [ -n "$latest" ] || die "no critique run found for the current turn; run counterpoint-run.sh first"
+  [ -n "$latest" ] || die "no successful critique run found for the current turn; run counterpoint-run.sh first (and check critique.stderr if it already ran and failed)"
   run="${latest%/}"
 fi
 
 [ -d "$run" ] || die "run dir not found: $run"
 [ -f "$run/log.txt" ] || die "run dir has no log.txt (not a critique run): $run"
+[ -f "$run/ok" ] || die "run dir has no ok marker (its critique failed or was empty): $run"
+[ -s "$final" ] || die "final deliverable is empty: $final"
 
 # --- write the shipped, revised deliverable ---
 cp "$final" "$run/result.md"

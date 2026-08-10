@@ -51,6 +51,14 @@ esac
 # What got written for this turn? A critique run has log.txt; a full-mode plan
 # phase (counterpoint-plan.sh) has plan_codex.txt; a full-mode plan review
 # (counterpoint-review.sh) has plan_review.txt.
+#
+# Each phase must ALSO carry the `ok` marker and a non-empty artifact. The
+# earlier version tested existence alone, and every phase script wrote its
+# artifact whether or not the Codex call had succeeded, so a timed-out or empty
+# critique satisfied the gate: the hook proved a file existed and nothing about
+# whether the audit had happened. One recorded run came back with a zero-byte
+# critique after nine minutes of a hung tool loop. `ok` is written only on a
+# usable result.
 ran=0
 planned=0
 reviewed=0
@@ -59,10 +67,10 @@ if [ -d "$home/runs" ]; then
   for d in "$home/runs"/*/; do
     [ -f "${d}turn_id" ] || continue
     [ "$(cat "${d}turn_id")" = "$turn_id" ] || continue
-    [ -f "${d}log.txt" ] && ran=1
-    [ -f "${d}plan_codex.txt" ] && planned=1
-    [ -f "${d}plan_review.txt" ] && reviewed=1
-    [ -f "${d}result.md" ] && finalized=1
+    [ -f "${d}log.txt" ] && [ -f "${d}ok" ] && [ -s "${d}critique.txt" ] && ran=1
+    [ -f "${d}plan_codex.txt" ] && [ -f "${d}ok" ] && [ -s "${d}plan_codex.txt" ] && planned=1
+    [ -f "${d}plan_review.txt" ] && [ -f "${d}ok" ] && [ -s "${d}plan_review.txt" ] && reviewed=1
+    [ -s "${d}result.md" ] && finalized=1
   done
 fi
 
@@ -79,6 +87,8 @@ fi
 # Block: the loop did not fully run this turn. Name the missing phase.
 {
   echo "counterpoint mode is ${mode} but the loop was not fully enforced this turn."
+  echo "A phase whose Codex call timed out or came back empty does NOT count as run;"
+  echo "check the matching *.stderr in the run dir before re-running it."
   if [ "$mode" = "full" ] && [ "$planned" != "1" ]; then
     echo "Missing the joint-planning front-end. Write Opus's plan to a file, then run:"
     echo "  ${skill_dir}/scripts/counterpoint-plan.sh --task \"<short>\" \\"

@@ -104,6 +104,22 @@ through the command instead of piping to Codex by hand:
    hook requires this plan artifact in full mode, so the front-end cannot be
    silently skipped.
 
+**Prefer the split form**, which removes the Codex plan latency from the turn
+entirely. Launch first, draft while it runs, then collect:
+
+```
+scripts/counterpoint-plan.sh --launch --task "<short>" --prompt <prompt-file> \
+  --resource <each resource> [--code]        # prints the run dir, returns at once
+<write Opus's plan to a file>
+scripts/counterpoint-plan.sh --collect --run <run-dir> --opus-plan <opus-plan-file>
+```
+
+Independence still holds by construction rather than by ordering: the planning
+prompt is assembled from the request and the resources only, so Codex never sees
+Opus's plan, and Codex's answer stays in a hidden pending file that only
+`--collect` promotes, so there is nothing for Opus to read early. Do not cat
+`.plan_codex.pending` by hand; that is the one move that would break it.
+
 ### Step F2, score both plans, then assign the producer
 
 This is the defined arbitration step, and it is decided on one thing only: plan
@@ -384,8 +400,9 @@ Revise from the critique, then finalize with `scripts/counterpoint-finalize.sh
 --final <revised-file> --caught "<one line>"`, which writes `result.md` (the
 shipped, revised deliverable) and resolves the role log. A `Stop` hook
 (`hooks/counterpoint-stop-hook.sh`) refuses to end the turn until both the run
-artifact (`log.txt`) and `result.md` exist, so neither the critique nor the
-revision can be silently skipped. The `--verifier` command is judged by its exit code, so do not mask it
+artifact (`log.txt`, carrying the `ok` marker and a non-empty critique) and a
+non-empty `result.md` exist, so neither the critique nor the revision can be
+silently skipped, and a Codex call that failed cannot pass for one that ran. The `--verifier` command is judged by its exit code, so do not mask it
 behind a pipe (e.g. `... | tail`), or a failing check will read as a pass. When
 Codex holds the producer role, use `scripts/codex-produce.sh` (text emission, or
 `--write DIR` for heavy multi-file production). Full design: `eng/07`.
@@ -425,7 +442,49 @@ critique (step 3):
 
 The `Stop` hook refuses to end a full-mode turn until all four artifacts
 (`plan_codex.txt`, `plan_review.txt`, `log.txt`, and the finalized `result.md`)
-exist for the turn, so no phase can be silently skipped.
+exist for the turn AND each Codex-backed phase carries its `ok` marker, so no
+phase can be silently skipped and none can be satisfied by a failed call.
+
+## When a Codex call fails
+
+Every out-of-session Codex call is bounded and every phase records whether it
+actually produced something usable. A phase that timed out or came back empty
+writes its artifact for debugging but no `ok` marker, and the `Stop` hook keys
+off that marker, so a failed call cannot pass for a completed phase. Three
+consequences worth knowing:
+
+- The command tells you on stdout, in a block starting `!!!`. Read it. Shipping
+  after a failed critique means shipping unaudited work while the role log claims
+  otherwise.
+- A failed critique does **not** consume a mini-loop round, so re-running the
+  same command is the correct response, including in small mode. The single-pass
+  bound counts audits, not attempts.
+- `counterpoint-finalize.sh` refuses to attach `result.md` to a failed run, so a
+  turn cannot be closed on one.
+
+Diagnose from the `.stderr` file beside the artifact (`critique.stderr`,
+`plan_codex.stderr`, `plan_review.stderr`, `code_review.stderr`).
+
+## Operational tuning
+
+Defaults are set for a normal turn; these exist for hosts and tasks that are not.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `COUNTERPOINT_CODEX_TIMEOUT` | `600` | Hard bound per Codex attempt, in seconds. `0` disables it, which is how the loop used to behave: one recorded run then spent nine minutes in a hung tool loop and returned nothing. |
+| `COUNTERPOINT_CODEX_RETRIES` | `1` | Extra attempts after a non-timeout failure. A timeout is never retried: a stuck run stays stuck and would just spend the bound twice. |
+| `COUNTERPOINT_PLAN_EFFORT` | `high` | Reasoning-effort **cap** for F1. |
+| `COUNTERPOINT_REVIEW_EFFORT` | `high` | Reasoning-effort cap for F3. |
+| `COUNTERPOINT_CRITIQUE_EFFORT` | (config) | Reasoning-effort cap for the critique and the code review. Unset means the configured effort. |
+| `COUNTERPOINT_RETENTION_DAYS` | `30` | Run-dir retention. `0` keeps everything. |
+| `COUNTERPOINT_TURN_ID` | (hook) | Turn attribution when running outside Claude Code, where no `current-turn` stamp exists. |
+| `COUNTERPOINT_CODEX_BYPASS_SANDBOX` | `0` | Set to `1` on a gVisor-style host, where Codex's bubblewrap sandbox cannot start. It covers the producer write path and `codex exec review`; without it the code review exits 0 while reporting it could not inspect the diff. |
+
+The effort settings are caps, never settings: they lower the configured effort
+for the cheaper phases and never raise it, so running the whole loop at `medium`
+stays at `medium` throughout. Planning and reading a merged plan do not need the
+budget an audit of a finished deliverable needs, and running every phase at the
+top of the scale was the single largest latency term in a turn.
 
 ## Scope of this MVP
 
@@ -445,4 +504,7 @@ chosen surface; an MCP wrapper was considered and dropped, since the CLI plus th
 `Stop` hook already enforces the loop. Supported on Linux and macOS with one
 shared codebase. Each turn makes one or more CLI calls to Codex on the ChatGPT
 subscription, so expect a multi-minute turn, and more in full mode because of the
-extra planning pass.
+extra planning pass. Three things keep that from growing without bound: the plan
+call overlaps Opus's own drafting (`--launch`/`--collect`), the code review runs
+alongside the critique rather than after it, and the two plan phases are capped
+at a lower reasoning effort than the critique.

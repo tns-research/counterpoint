@@ -6,16 +6,27 @@
 # printed to stdout; reasoning/progress go to stderr.
 #
 # Usage:
-#   printf '%s' "$PROMPT" | codex-consult.sh [-m MODEL] [-C DIR]
+#   printf '%s' "$PROMPT" | codex-consult.sh [-m MODEL] [-e EFFORT] [-C DIR]
 #
-# Exit code is Codex's; on success the clean final message is on stdout.
+# -e caps the reasoning effort for this pass (see cp_effort_min): it can lower
+# the configured effort for a cheap phase, never raise it.
+#
+# Exit code: 0 on success with the clean final message on stdout. 124 means the
+# call hit the time bound; 3 means Codex returned an empty final message. Both
+# are failures the caller must surface rather than treat as a critique.
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./counterpoint-lib.sh
+. "$script_dir/counterpoint-lib.sh"
+
 model=""
+effort_cap=""
 cd_dir="$PWD"
 while [ $# -gt 0 ]; do
   case "$1" in
     -m) model="$2"; shift 2 ;;
+    -e) effort_cap="$2"; shift 2 ;;
     -C) cd_dir="$2"; shift 2 ;;
     *) echo "codex-consult.sh: unknown arg '$1'" >&2; exit 2 ;;
   esac
@@ -27,7 +38,12 @@ if [ -t 0 ]; then
 fi
 
 out="$(mktemp)"
-trap 'rm -f "$out"' EXIT
+# The prompt is buffered to a file rather than piped straight through: stdin is a
+# pipe, a retry cannot re-read it, and the second attempt would otherwise reach
+# Codex empty.
+prompt_file="$(mktemp)"
+trap 'rm -f "$out" "$prompt_file"' EXIT
+cat > "$prompt_file"
 
 # Parity contract, and the gVisor hang fix (see eng/07): a read-only critic must
 # reason from the inlined parity context only. The user's config.toml
@@ -37,9 +53,10 @@ trap 'rm -f "$out"' EXIT
 # server generically. It also drops the user's model/reasoning defaults, so
 # re-inject those from the config (an explicit -m still wins) to avoid a silent
 # model downgrade.
-cfg="${CODEX_HOME:-$HOME/.codex}/config.toml"
-cfg_model="$(awk '/^\[/{exit} /^[[:space:]]*model[[:space:]]*=/{sub(/^[^=]*=[[:space:]]*/,""); gsub(/"/,""); print; exit}' "$cfg" 2>/dev/null || true)"
-cfg_reasoning="$(awk '/^\[/{exit} /^[[:space:]]*model_reasoning_effort[[:space:]]*=/{sub(/^[^=]*=[[:space:]]*/,""); gsub(/"/,""); print; exit}' "$cfg" 2>/dev/null || true)"
+cfg_model="$(cp_cfg_value model)"
+cfg_reasoning="$(cp_cfg_value model_reasoning_effort)"
+effort="$cfg_reasoning"
+[ -n "$effort_cap" ] && effort="$(cp_effort_min "$effort_cap" "$cfg_reasoning")"
 
 args=(exec -s read-only --skip-git-repo-check --color never --ignore-user-config -C "$cd_dir" -o "$out")
 if [ -n "$model" ]; then
@@ -47,10 +64,17 @@ if [ -n "$model" ]; then
 elif [ -n "$cfg_model" ]; then
   args+=(-c "model=\"$cfg_model\"")
 fi
-[ -n "$cfg_reasoning" ] && args+=(-c "model_reasoning_effort=\"$cfg_reasoning\"")
+[ -n "$effort" ] && args+=(-c "model_reasoning_effort=\"$effort\"")
 args+=(-)
 
-# Progress/reasoning to stderr; final message captured via -o.
-codex "${args[@]}" >&2
+# Bounded in time, retried once on a transient failure, and an empty final
+# message is a failure rather than a silent pass. Progress/reasoning to stderr;
+# the final message is captured via -o.
+rc=0
+cp_codex_exec "$out" --stdin "$prompt_file" -- "${args[@]}" || rc=$?
+if [ "$rc" != 0 ]; then
+  cat "$out"
+  exit "$rc"
+fi
 
 cat "$out"

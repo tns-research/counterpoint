@@ -44,6 +44,8 @@ home="${COUNTERPOINT_HOME:-$HOME/.counterpoint}"
 skill_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 consult="$skill_dir/scripts/codex-consult.sh"
 scaffold="$skill_dir/prompts/karpathy-scaffold.txt"
+# shellcheck source=./counterpoint-lib.sh
+. "$skill_dir/scripts/counterpoint-lib.sh"
 
 task=""
 plan=""
@@ -53,6 +55,7 @@ producer=""
 resources=()
 is_code=0
 model=""
+effort="${COUNTERPOINT_REVIEW_EFFORT:-high}"
 
 die() { echo "counterpoint-review.sh: $1" >&2; exit 2; }
 
@@ -66,6 +69,7 @@ while [ $# -gt 0 ]; do
     --resource) resources+=("$2"); shift 2 ;;
     --code) is_code=1; shift ;;
     -m) model="$2"; shift 2 ;;
+    -e) effort="$2"; shift 2 ;;
     *) die "unknown arg '$1'" ;;
   esac
 done
@@ -85,11 +89,11 @@ case "$producer" in opus|codex) : ;; *) die "--producer must be opus or codex" ;
 [ -f "$scaffold" ] || die "scaffold not found: $scaffold"
 
 # Tie this run to the current turn (the UserPromptSubmit hook writes the marker).
-turn_id="manual"
-[ -f "$home/current-turn" ] && turn_id="$(tr -d '[:space:]' < "$home/current-turn")"
+turn_id="$(cp_turn_id "$home")"
 
 runs_dir="$home/runs"
 mkdir -p "$runs_dir"
+cp_gc_runs "$runs_dir"
 
 ts="$(date +%Y%m%dT%H%M%S)-$$"
 run="$runs_dir/$ts"
@@ -107,7 +111,7 @@ if [ "$reviewer" = "codex" ]; then
     echo
     echo "</original_request>"
     echo
-    for r in "${resources[@]}"; do
+    for r in ${resources+"${resources[@]}"}; do
       if [ -f "$r" ]; then
         echo "<resource path=\"$r\">"
         cat "$r"
@@ -145,8 +149,9 @@ INSTR
 
   echo ">>> counterpoint: running Codex plan review (read-only) ..." >&2
   consult_args=()
-  [ -n "$model" ] && consult_args=(-m "$model")
-  if "$consult" "${consult_args[@]}" < "$revctx" > "$plan_review" 2>>"$run/plan_review.stderr"; then
+  [ -n "$model" ] && consult_args+=(-m "$model")
+  [ -n "$effort" ] && consult_args+=(-e "$effort")
+  if "$consult" ${consult_args+"${consult_args[@]}"} < "$revctx" > "$plan_review" 2>>"$run/plan_review.stderr"; then
     review_ok=1
   else
     review_ok=0
@@ -173,7 +178,7 @@ fi
 
 # --- artifact: meta marks this as the review phase. No log.txt is written, so
 #     counterpoint-run.sh does not count this dir as a mini-loop round. ---
-jstr() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n'; }
+jstr() { cp_jstr "$1"; }
 {
   echo "{"
   echo "  \"ts\": \"$(jstr "$ts")\","
@@ -187,10 +192,18 @@ jstr() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n'; }
   echo "  \"review_ok\": $([ "$review_ok" = 1 ] && echo true || echo false)"
   echo "}"
 } > "$run/meta.json"
+# The success marker: a failed or empty Codex review must not read to the Stop
+# hook as a completed F3 phase.
+[ "$review_ok" = 1 ] && : > "$run/ok"
 
 # --- report to the orchestrator on stdout ---
 echo "=== counterpoint plan review: $run ==="
 echo
+if [ "$review_ok" != 1 ]; then
+  echo "!!! CODEX PLAN REVIEW FAILED: no usable review came back (see plan_review.stderr)."
+  echo "!!! This phase is NOT recorded as done; re-run before producing."
+  echo
+fi
 echo "--- plan review (reviewer=$reviewer) ---"
 cat "$plan_review"
 echo

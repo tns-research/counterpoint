@@ -24,9 +24,13 @@ ok() { if [ "$2" = "$3" ]; then echo "PASS: $1"; pass=$((pass + 1)); else echo "
 contains() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 
 # Run one critique in a fresh isolated home with `nprior` prior critique runs
-# already recorded for this turn. Prints "<exit>|<stderr>".
+# already recorded for this turn. `nfailed` optional prior runs that FAILED (a
+# log.txt with no `ok` marker) are added too: those must not count as rounds, or
+# a transient Codex failure would burn the single pass small mode is allowed and
+# lock the turn out of its own retry while the Stop hook still demands a critique.
+# Prints "<exit>|<stderr>".
 run_case() {
-  local mode="$1" nprior="$2"
+  local mode="$1" nprior="$2" nfailed="${3:-0}"
   local work; work="$(mktemp -d)"
   export COUNTERPOINT_HOME="$work"
   mkdir -p "$work/runs"
@@ -36,6 +40,14 @@ run_case() {
     mkdir -p "$work/runs/prior$i"
     echo "turn-1" > "$work/runs/prior$i/turn_id"
     : > "$work/runs/prior$i/log.txt"
+    : > "$work/runs/prior$i/ok"
+    i=$((i + 1))
+  done
+  i=0
+  while [ "$i" -lt "$nfailed" ]; do
+    mkdir -p "$work/runs/failed$i"
+    echo "turn-1" > "$work/runs/failed$i/turn_id"
+    : > "$work/runs/failed$i/log.txt"
     i=$((i + 1))
   done
   echo "draft body" > "$work/draft.md"
@@ -56,8 +68,14 @@ r="$(run_case small 1)"; code="${r%%|*}"; msg="${r#*|}"
 ok "small round 2 is refused (exit 2)" "$code" 2
 if contains "$msg" "single-pass"; then ok "small refusal names single-pass" yes yes; else ok "small refusal names single-pass" "$msg" "single-pass"; fi
 
+# A prior run that FAILED does not consume the single pass: small mode may retry.
+r="$(run_case small 0 2)"; ok "small retries after failed runs (exit 0)" "${r%%|*}" 0
+
 # Full mode keeps iterating: a second critique in the same turn is allowed.
 r="$(run_case full 1)"; ok "full round 2 is allowed (exit 0)" "${r%%|*}" 0
+
+# Failed rounds do not count toward the full-mode cap either.
+r="$(run_case full 2 3)"; ok "full cap ignores failed rounds (exit 0)" "${r%%|*}" 0
 
 # Full mode still caps the mini-loop: past 3 rounds it refuses.
 r="$(run_case full 3)"; code="${r%%|*}"; msg="${r#*|}"

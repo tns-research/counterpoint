@@ -90,7 +90,9 @@ log.txt). Revise from the returned critique, then finalize with
 
 which writes result.md (the shipped, revised deliverable) and resolves the log.
 A Stop hook will refuse to end the turn until both the run artifact and result.md
-exist, so the loop cannot be silently skipped. This is a bounded single exchange;
+exist AND the critique actually succeeded, so the loop cannot be silently skipped
+and a failed Codex call cannot pass for one that ran. If a phase reports a
+failure, re-run it: a failed call is not counted as a round. This is a bounded single exchange;
 do not loop beyond the capped mini-loop.
 EOF
 
@@ -99,7 +101,9 @@ if [ "$effective" = "full" ]; then
 In full mode two more phases are enforced before the critique, so the Stop hook
 requires the joint plan, the plan review, the critique, and result.md this turn
 (the first three below, then finalize as above). Run:
-  ${skill_dir}/scripts/counterpoint-plan.sh   (F1: both models plan; writes plan_codex.txt)
+  ${skill_dir}/scripts/counterpoint-plan.sh   (F1: both models plan; writes plan_codex.txt.
+                                  Prefer --launch ... then --collect, so Codex plans
+                                  while you draft yours instead of after it)
   ${skill_dir}/scripts/counterpoint-review.sh (F3: the non-producer reviews the reconciled plan;
                                   writes plan_review.txt. Codex reviewer = read-only
                                   Codex call; Opus reviewer = in-session, no Codex call)
