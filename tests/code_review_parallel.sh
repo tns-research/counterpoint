@@ -94,14 +94,35 @@ contains "$rargs" "--color" && ok "review does not pass --color (the subcommand 
 
 # On a host where Codex's own sandbox cannot start, review silently loses its
 # access to the diff and reports that it could not inspect anything, exit 0 and
-# all. The bypass opt-in has to reach this call site too, or the code pass is
-# decorative there.
-contains "$rargs" "--dangerously-bypass-approvals-and-sandbox" && ok "review has no bypass by default" present absent || ok "review has no bypass by default" absent absent
-COUNTERPOINT_FAKE_SLEEP=0 COUNTERPOINT_TURN_ID="turn-code-2" COUNTERPOINT_CODEX_BYPASS_SANDBOX=1 \
-  bash "$run_sh" --mode small --task t --draft "$work/draft.md" --prompt "$work/prompt.txt" \
-  --producer opus --critic codex --code >/dev/null 2>&1
-rargs="$(tail -n 1 "$COUNTERPOINT_FAKE_REVIEW_ARGS")"
-contains "$rargs" "--dangerously-bypass-approvals-and-sandbox" && ok "review honors the sandbox bypass opt-in" yes yes || ok "review honors the sandbox bypass opt-in" "$rargs" "bypass"
+# all. The flag that fixes it used to be an opt-in env var, which meant it was
+# off exactly where it was needed; it now follows a probe of the host. These two
+# cases pin the flag to the probe rather than to an environment default, so the
+# suite gives the same answer on a sandboxed CI box and on a laptop.
+# tests/sandbox_bypass.sh covers the decision itself.
+bwrapstub="$work/bwrapbin"
+mkdir -p "$bwrapstub"
+cat > "$bwrapstub/bwrap" <<'BW'
+#!/usr/bin/env bash
+[ "${COUNTERPOINT_FAKE_BWRAP:-ok}" = "broken" ] || exit 0
+for a in "$@"; do [ "$a" = "--unshare-net" ] && exit 1; done
+exit 0
+BW
+chmod +x "$bwrapstub/bwrap"
+
+review_flag_for_host() {
+  PATH="$bwrapstub:$PATH" COUNTERPOINT_FAKE_BWRAP="$1" COUNTERPOINT_FAKE_SLEEP=0 \
+    COUNTERPOINT_TURN_ID="turn-code-$1" \
+    env -u COUNTERPOINT_CODEX_BYPASS_SANDBOX \
+    bash "$run_sh" --mode small --task t --draft "$work/draft.md" --prompt "$work/prompt.txt" \
+    --producer opus --critic codex --code >/dev/null 2>&1
+  tail -n 1 "$COUNTERPOINT_FAKE_REVIEW_ARGS"
+}
+
+rargs="$(review_flag_for_host ok)"
+contains "$rargs" "--dangerously-bypass-approvals-and-sandbox" && ok "a working sandbox is left in force" present absent || ok "a working sandbox is left in force" absent absent
+
+rargs="$(review_flag_for_host broken)"
+contains "$rargs" "--dangerously-bypass-approvals-and-sandbox" && ok "a sandbox that cannot start gets the bypass without being asked" yes yes || ok "a sandbox that cannot start gets the bypass without being asked" "$rargs" "bypass"
 
 # --- the hard verifier is bounded too ----------------------------------------
 # Every Codex call was bounded but the verifier was not, and it is an arbitrary

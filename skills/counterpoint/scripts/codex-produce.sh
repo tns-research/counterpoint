@@ -91,7 +91,12 @@ add_model_config() {
 
 if [ -n "$write_dir" ]; then
   mkdir -p "$write_dir"
-  if [ "${COUNTERPOINT_CODEX_BYPASS_SANDBOX:-0}" = "1" ]; then
+  # Decided by probing whether Codex's sandbox can actually start here, not by
+  # an env var the caller has to know to set. On a host where it cannot, the
+  # producer used to fail at writing anything while still exiting 0.
+  bypass="$(cp_sandbox_bypass)"
+  cp_sandbox_announce "the --write producer" "$bypass"
+  if [ "$bypass" = "1" ]; then
     # Externally-sandboxed host where bubblewrap fails: the outer sandbox is the
     # isolation, so bypass Codex's own and anchor it to the scratch dir.
     args=(exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --color never -C "$write_dir" -o "$out")

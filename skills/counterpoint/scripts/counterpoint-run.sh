@@ -223,6 +223,13 @@ if [ "$critic" = "codex" ]; then
     cfg_model="$(cp_cfg_value model)"
     cfg_reasoning="$(cp_cfg_value model_reasoning_effort)"
     review_effort="$(cp_effort_min "${COUNTERPOINT_CRITIQUE_EFFORT:-$cfg_reasoning}" "$cfg_reasoning")"
+    review_bypass="$(cp_sandbox_bypass)"
+    cp_sandbox_announce "codex exec review" "$review_bypass"
+    # If the sandbox is known-broken and the bypass was explicitly refused, this
+    # pass cannot read the diff. It would still exit 0 with a courteous "no
+    # findings", so it is failed here rather than appended as a verdict.
+    review_blind=0
+    if [ "$review_bypass" = "0" ] && ! cp_sandbox_usable; then review_blind=1; fi
     (
       # Flags verified against codex-cli 0.144: `review` is its own subcommand
       # with its own parser. It rejects --color ("unexpected argument"), which
@@ -236,7 +243,7 @@ if [ "$critic" = "codex" ]; then
       # the pass comes back saying it "could not inspect the repository diff"
       # while still exiting 0. With the outer sandbox providing the isolation,
       # the bypass is what makes this pass actually see the change.
-      [ "${COUNTERPOINT_CODEX_BYPASS_SANDBOX:-0}" = "1" ] && rargs+=(--dangerously-bypass-approvals-and-sandbox)
+      [ "$review_bypass" = "1" ] && rargs+=(--dangerously-bypass-approvals-and-sandbox)
       [ -n "$cfg_model" ] && rargs+=(-c "model=\"$cfg_model\"")
       [ -n "$review_effort" ] && rargs+=(-c "model_reasoning_effort=\"$review_effort\"")
       cp_codex_exec "$review_out" -- "${rargs[@]}"
@@ -260,7 +267,9 @@ if [ "$critic" = "codex" ]; then
     {
       echo
       echo "=== codex exec review ==="
-      if [ "$review_rc" = 0 ] && [ -s "$review_out" ]; then
+      if [ "$review_blind" = "1" ]; then
+        echo "(codex exec review could not read the diff: Codex's sandbox cannot start on this host and COUNTERPOINT_CODEX_BYPASS_SANDBOX=0 refuses the bypass. Its verdict is discarded rather than reported as a clean review.)"
+      elif [ "$review_rc" = 0 ] && [ -s "$review_out" ]; then
         cat "$review_out"
       else
         echo "(codex exec review failed with exit $review_rc; see code_review.stderr)"

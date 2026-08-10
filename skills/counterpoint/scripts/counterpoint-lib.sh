@@ -108,6 +108,65 @@ cp_effort_min() {
   printf '%s' "$r"
 }
 
+# --- Codex's own sandbox -----------------------------------------------------
+# Codex sandboxes the shell commands it runs. On Linux that is bubblewrap, which
+# needs a network namespace it can configure; under an outer sandbox (gVisor
+# here, but also some container setups) that call is refused and EVERY command
+# Codex tries returns "bwrap: loopback: Failed RTM_NEWADDR". The model then
+# writes its answer from no evidence at all and exits 0. Measured on this host:
+# `codex exec review --uncommitted` came back with a 151-byte "No actionable
+# findings were identified. However, confidence is low because the repository
+# could not be inspected", exit 0, non-empty output, so every check downstream
+# read it as a completed review. The same run with the sandbox bypassed found
+# the planted regression. A silent pass on the code path is exactly the class of
+# failure the enforcement work removed everywhere else.
+#
+# Detection probes the capability instead of fingerprinting the host, so it also
+# covers containers that block namespaces for their own reasons. Grepping
+# /proc/version for gvisor is the fallback for hosts with no bwrap binary to ask.
+# Scanning Codex's stderr for "bwrap:" was the other candidate and is rejected on
+# purpose: the string shows up verbatim when Codex reads a log file that recorded
+# an earlier failure, which happens the moment counterpoint reviews its own repo.
+cp_sandbox_usable() {
+  case "$(uname -s 2>/dev/null)" in
+    Darwin) return 0 ;;   # Seatbelt, no namespaces involved
+  esac
+  if command -v bwrap >/dev/null 2>&1; then
+    bwrap --unshare-net --ro-bind / / --dev /dev /bin/true >/dev/null 2>&1 && return 0
+    return 1
+  fi
+  grep -qi 'gvisor' /proc/version 2>/dev/null && return 1
+  return 0   # unknown host: assume the sandbox works rather than weaken it on a guess
+}
+
+# Whether to hand Codex --dangerously-bypass-approvals-and-sandbox for the two
+# calls that need to run commands (the --write producer and `exec review`).
+#
+# The flag is only ever safe because something else is doing the isolating, and
+# that is precisely the condition being detected: the sandbox cannot start
+# BECAUSE an outer sandbox is already confining the process. Auto-enabling it
+# there is not a weakened default, it is the only configuration in which those
+# two phases produce anything. COUNTERPOINT_CODEX_BYPASS_SANDBOX=1 forces it on,
+# =0 forces it off (and the caller is told the pass will be blind).
+cp_sandbox_bypass() {
+  case "${COUNTERPOINT_CODEX_BYPASS_SANDBOX:-}" in
+    1) printf '1'; return 0 ;;
+    0) printf '0'; return 0 ;;
+  esac
+  if cp_sandbox_usable; then printf '0'; else printf '1'; fi
+}
+
+# One line on stderr saying which way it went, because the whole point is that
+# this decision stops being invisible. Callers invoke it once, before the call.
+cp_sandbox_announce() {
+  local phase="${1:-codex}" bypass="$2"
+  if [ "$bypass" = "1" ] && [ -z "${COUNTERPOINT_CODEX_BYPASS_SANDBOX:-}" ]; then
+    echo "counterpoint: Codex's sandbox cannot start on this host (outer sandbox blocks it); $phase runs with --dangerously-bypass-approvals-and-sandbox, which is safe only because that outer sandbox is the isolation. Set COUNTERPOINT_CODEX_BYPASS_SANDBOX=0 to refuse." >&2
+  elif [ "$bypass" = "0" ] && ! cp_sandbox_usable; then
+    echo "counterpoint: WARNING Codex's sandbox cannot start here and the bypass is off, so $phase will report from an unreadable repository and still exit 0. Unset COUNTERPOINT_CODEX_BYPASS_SANDBOX to let counterpoint handle it." >&2
+  fi
+}
+
 # --- bounded Codex invocation ------------------------------------------------
 cp_timeout_bin() {
   if command -v timeout >/dev/null 2>&1; then printf 'timeout'

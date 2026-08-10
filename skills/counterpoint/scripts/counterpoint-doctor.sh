@@ -90,16 +90,20 @@ echo "sandbox"
 # Codex's workspace-write sandbox uses bubblewrap, which cannot start under an
 # outer sandbox like gVisor. There the write path and `codex exec review` come
 # back empty-handed while still exiting 0, which reads as a pass.
-outer=""
-[ -d /proc ] && grep -qi 'gvisor' /proc/version 2>/dev/null && outer="gVisor"
-if [ -n "$outer" ]; then
-  if [ "${COUNTERPOINT_CODEX_BYPASS_SANDBOX:-0}" = "1" ]; then
-    good "$outer detected and COUNTERPOINT_CODEX_BYPASS_SANDBOX=1: the write path and code review can see the repo"
+host_hint=""
+[ -d /proc ] && grep -qi 'gvisor' /proc/version 2>/dev/null && host_hint=" (gVisor)"
+bypass="$(cp_sandbox_bypass)"
+if cp_sandbox_usable; then
+  if [ "$bypass" = "1" ]; then
+    warn "Codex's sandbox works here, but COUNTERPOINT_CODEX_BYPASS_SANDBOX=1 turns it off anyway; the write path and code review run with full access for no reason"
   else
-    warn "$outer detected: Codex's own sandbox cannot start here, so --write and code review will come back blind. Set COUNTERPOINT_CODEX_BYPASS_SANDBOX=1 (safe only because the outer sandbox is the isolation)."
+    good "Codex's sandbox can start here; it is in force for the write path and code review"
   fi
+elif [ "$bypass" = "1" ]; then
+  good "Codex's sandbox cannot start on this host$host_hint; the bypass is applied automatically so the write path and code review can read the repo"
+  [ -n "${COUNTERPOINT_CODEX_BYPASS_SANDBOX:-}" ] && say "      set explicitly via COUNTERPOINT_CODEX_BYPASS_SANDBOX=1"
 else
-  good "no outer sandbox detected; Codex's own sandbox is in force"
+  warn "Codex's sandbox cannot start on this host$host_hint and COUNTERPOINT_CODEX_BYPASS_SANDBOX=0 refuses the bypass: code review is failed on purpose instead of reporting from an unreadable repo, and --write cannot produce. Unset the variable to let counterpoint handle it."
 fi
 command -v git >/dev/null 2>&1 && good "git present (codex exec review reads the working diff)" \
   || warn "git missing; the code-review pass has no diff to read"
