@@ -267,22 +267,37 @@ skills/counterpoint/
   scripts/counterpoint-run.sh     the critique half, enforced (writes draft.md + log.txt)
   scripts/counterpoint-finalize.sh records the revised deliverable (writes result.md)
   scripts/counterpoint-mode.sh    the off/small/full toggle CLI
+  scripts/counterpoint-lib.sh     the shared floor: time bound, retry, sandbox probe, JSON
+  scripts/counterpoint-doctor.sh  what this machine will actually do, before a turn needs it
   hooks/counterpoint-hook.sh      the UserPromptSubmit hook: arms + injects
   hooks/counterpoint-stop-hook.sh the Stop hook: refuses to end until artifacts exist
-tests/                            dependency-free regression tests for hooks and helpers
+tests/                            dependency-free regression tests, run them with
+                                  tests/run-all.sh (twice, if a bash 3.2 is around)
 ```
 
 ## ✅ Status
 
-Working MVP. Both modes run, both invocation paths (manual slash command and
-always-on hook) are wired, and each turn makes one or more real `codex exec`
-calls on the ChatGPT subscription. The enforced loop has been run live and
-hook-driven on real tasks: a full-mode data audit where both the joint plan and
-the cross-model critique caught real defects, and a run with Codex as the
-file-writing producer. A regression test pins small mode to its strictly-linear
-shape. Expect a multi-minute turn, more in full mode because of the extra
-planning pass. The CLI is the chosen surface; an MCP wrapper was considered and
-dropped, since the CLI plus the `Stop` hook already enforces the loop.
+Working, and hardened past the MVP it started as. Both modes run, both invocation
+paths (manual slash command and always-on hook) are wired, and each turn makes
+one or more real `codex exec` calls on the ChatGPT subscription. The enforced
+loop has been run live and hook-driven on real tasks: a full-mode data audit
+where both the joint plan and the cross-model critique caught real defects, and a
+run with Codex as the file-writing producer.
+
+Every Codex call is now time-bounded and retried once on a transient failure, and
+each phase writes an `ok` marker only when the call produced something usable, so
+a stalled or empty pass fails the turn instead of leaving behind a clean-looking
+set of artifacts. The joint plan runs in the background while the orchestrator
+writes its own, and on code tasks `codex exec review` runs alongside the
+critique. A measured full-mode turn came in at 3 min 35 s end to end, of which
+2 min 12 s was Codex latency, against a 6.5-minute median before that work.
+
+The suite is 94 assertions across 7 files, dependency-free behind a fake `codex`
+binary, and `tests/run-all.sh` replays all of it a second time under a bash 3.2
+when it finds one. macOS is held by that replay plus BSD stubs rather than by a
+real Mac, which is worth knowing before trusting it on one. The CLI is the chosen
+surface; an MCP wrapper was considered and dropped, since the CLI plus the `Stop`
+hook already enforces the loop.
 
 ## License
 
