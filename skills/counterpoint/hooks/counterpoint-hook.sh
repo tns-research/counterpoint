@@ -47,8 +47,15 @@ esac
 
 # Stamp a fresh turn id every prompt so the run command and the Stop hook always
 # see the CURRENT turn (v2 enforcement, see eng/07). One stamp per user prompt.
+#
+# Deliberately not `date +%s%N`: BSD date has no %N and emits a literal "N", so
+# on macOS every id was "<seconds>N-<pid>" and only stayed unique by accident.
+# Second + pid + $RANDOM is unique on both platforms for the property that is
+# actually needed, which is that two turns never collide. The hook stays
+# dependency-free (it must never fail and block a prompt), so this is inline
+# rather than sourced from counterpoint-lib.sh.
 mkdir -p "$home"
-turn_id="$(date +%s%N)-$$"
+turn_id="$(date +%s)-$$-${RANDOM:-0}"
 printf '%s\n' "$turn_id" > "$home/current-turn"
 
 # Purge any per-turn markers an older build left on disk. Enforcement is now
@@ -69,10 +76,21 @@ else
   depth_line="produce, critique with full context parity, settle on the verification ladder, revise, and deliver (no joint planning front-end)"
 fi
 
+# Uppercased by hand, not with ${effective^^}: that operator is bash 4, and
+# macOS ships bash 3.2 as /bin/bash, which `env bash` finds on any Mac without a
+# newer one earlier in PATH. There the expansion raised "bad substitution", the
+# whole heredoc failed, the hook still exited 0, and the directive was never
+# injected -- counterpoint looked installed and silently did nothing on macOS.
+case "$effective" in
+  small) effective_uc="SMALL" ;;
+  full)  effective_uc="FULL" ;;
+  *)     effective_uc="$effective" ;;
+esac
+
 cat <<EOF
 [counterpoint: ON, mode=${effective}]
 The counterpoint loop is active for this turn. Before answering, run the
-counterpoint skill at ${effective^^} depth on this request: ${depth_line}.
+counterpoint skill at ${effective_uc} depth on this request: ${depth_line}.
 Follow ${skill_dir}/SKILL.md for the choreography. Run the audited half through
 the command so the loop is enforced, not just narrated: save the producer's
 draft to a file, then call

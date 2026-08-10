@@ -31,7 +31,7 @@ contains() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 # Prints "<exit>|<stderr>".
 run_case() {
   local mode="$1" nprior="$2" nfailed="${3:-0}"
-  local work; work="$(mktemp -d)"
+  local work; work="$(mktemp -d "${TMPDIR:-/tmp}/counterpoint-test.XXXXXX")"
   export COUNTERPOINT_HOME="$work"
   mkdir -p "$work/runs"
   echo "turn-1" > "$work/current-turn"

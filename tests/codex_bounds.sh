@@ -24,7 +24,7 @@ fail=0
 ok() { if [ "$2" = "$3" ]; then echo "PASS: $1"; pass=$((pass + 1)); else echo "FAIL: $1 (want $3, got $2)"; fail=$((fail + 1)); fi; }
 contains() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 
-work="$(mktemp -d)"
+work="$(mktemp -d "${TMPDIR:-/tmp}/counterpoint-test.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
 fakebin="$work/bin"

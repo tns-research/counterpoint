@@ -41,7 +41,9 @@
 #
 # Every Codex call here is bounded by COUNTERPOINT_CODEX_TIMEOUT (default 600s)
 # and retried once on a transient failure, and an empty final message counts as a
-# failure. A run that did not get a usable critique writes no `ok` marker: it is
+# failure. The hard verifier is bounded too, by COUNTERPOINT_VERIFIER_TIMEOUT
+# (default 900s), so a hung test suite fails the turn instead of freezing it.
+# A run that did not get a usable critique writes no `ok` marker: it is
 # not counted as a mini-loop round, the Stop hook keeps refusing to end the turn,
 # and stdout says so plainly. On code tasks `codex exec review` runs in parallel
 # with the critique instead of after it.
@@ -288,11 +290,23 @@ verifier_exit=""
 verdict="n/a"
 if [ -n "$verifier" ]; then
   echo ">>> counterpoint: running verifier: $verifier" >&2
+  # Bounded like every Codex call, and for the same reason: the verifier is an
+  # arbitrary command the orchestrator supplies, so a hung test suite or a
+  # process waiting on input froze the turn with no way out. A verifier that
+  # times out is a FAIL the orchestrator must act on, not a hang.
+  vtmo="${COUNTERPOINT_VERIFIER_TIMEOUT:-900}"
   set +e
-  bash -c "$verifier" > "$run/verifier.txt" 2>&1
+  cp_bound "$vtmo" -- bash -c "$verifier" > "$run/verifier.txt" 2>&1
   verifier_exit=$?
   set -e
-  if [ "$verifier_exit" = "0" ]; then verdict="PASS"; else verdict="FAIL"; fi
+  if [ "$verifier_exit" = "0" ]; then
+    verdict="PASS"
+  else
+    verdict="FAIL"
+    if [ "$verifier_exit" = "124" ]; then
+      echo "(verifier exceeded the ${vtmo}s bound and was killed)" >> "$run/verifier.txt"
+    fi
+  fi
 fi
 
 # Arbiter rung: a real hard verifier outranks the soft critique.

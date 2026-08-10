@@ -36,7 +36,7 @@ missing() {
   esac
 }
 
-work="$(mktemp -d)"
+work="$(mktemp -d "${TMPDIR:-/tmp}/counterpoint-test.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
 fakebin="$work/bin"

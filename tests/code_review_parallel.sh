@@ -25,7 +25,7 @@ fail=0
 ok() { if [ "$2" = "$3" ]; then echo "PASS: $1"; pass=$((pass + 1)); else echo "FAIL: $1 (want $3, got $2)"; fail=$((fail + 1)); fi; }
 contains() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 
-work="$(mktemp -d)"
+work="$(mktemp -d "${TMPDIR:-/tmp}/counterpoint-test.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
 fakebin="$work/bin"
@@ -102,6 +102,26 @@ COUNTERPOINT_FAKE_SLEEP=0 COUNTERPOINT_TURN_ID="turn-code-2" COUNTERPOINT_CODEX_
   --producer opus --critic codex --code >/dev/null 2>&1
 rargs="$(tail -n 1 "$COUNTERPOINT_FAKE_REVIEW_ARGS")"
 contains "$rargs" "--dangerously-bypass-approvals-and-sandbox" && ok "review honors the sandbox bypass opt-in" yes yes || ok "review honors the sandbox bypass opt-in" "$rargs" "bypass"
+
+# --- the hard verifier is bounded too ----------------------------------------
+# Every Codex call was bounded but the verifier was not, and it is an arbitrary
+# command the orchestrator supplies: a hung test suite or one waiting on input
+# froze the turn with no way out. A verifier that runs past its bound is a FAIL
+# the orchestrator can act on.
+started="$(date +%s)"
+out="$(COUNTERPOINT_FAKE_SLEEP=0 COUNTERPOINT_TURN_ID="turn-code-3" COUNTERPOINT_VERIFIER_TIMEOUT=2 \
+  bash "$run_sh" --mode small --task t --draft "$work/draft.md" --prompt "$work/prompt.txt" \
+  --producer opus --critic codex --verifier "sleep 60" 2>/dev/null)"
+elapsed=$(( $(date +%s) - started ))
+run3="$(printf '%s' "$out" | sed -n 's/^run dir: //p')"
+if [ "$elapsed" -le 15 ]; then ok "a hung verifier is killed at its bound" fast fast
+else ok "a hung verifier is killed at its bound" "${elapsed}s" fast; fi
+contains "$out" "verifier verdict: FAIL (exit 124)" \
+  && ok "a timed-out verifier reads as FAIL 124" yes yes \
+  || ok "a timed-out verifier reads as FAIL 124" "$(printf '%s' "$out" | sed -n 's/^--- verifier.*/&/p')" "FAIL 124"
+contains "$(cat "$run3/verifier.txt" 2>/dev/null)" "exceeded the 2s bound" \
+  && ok "verifier.txt says why it failed" yes yes \
+  || ok "verifier.txt says why it failed" no yes
 
 echo
 echo "== $pass passed, $fail failed =="

@@ -201,8 +201,17 @@ hook backstop is armed by the toggle.
 - 🔌 **Two active subscriptions.** counterpoint runs Claude Opus and OpenAI Codex
   side by side, so it draws on a Claude plan (for Opus) and a ChatGPT plan (for
   Codex) at once. Both must be signed in; there is no metered-API path.
-- 💻 **Linux or macOS.** One shared codebase covers both. Windows is not supported
-  for now (it would need WSL or a separate runtime).
+- 💻 **Linux or macOS.** One shared codebase covers both, and macOS means a stock
+  Mac: bash 3.2 at `/bin/bash`, BSD userland, no Homebrew coreutils. Nothing in
+  the scripts uses bash-4 syntax or a GNU-only flag, and the time bound falls
+  back to a shell watchdog where `timeout(1)` does not exist.
+  `tests/portability.sh` holds that line, and `tests/run-all.sh` re-runs the whole
+  suite under a bash 3.2 when it finds one. Windows is not supported (it would
+  need WSL or a separate runtime).
+- 🩺 **Not sure the machine is ready?** `skills/counterpoint/scripts/counterpoint-doctor.sh`
+  reports the bash version, whether the time bound is enforced by `timeout(1)` or
+  the watchdog, the Codex CLI and its model/effort, whether both hooks are wired,
+  and how much the run archive is holding.
 - 🤖 **Claude Code**, with this skill discoverable (symlink the skill into
   `~/.claude/skills/`, the repo stays the source of truth):
   ```bash

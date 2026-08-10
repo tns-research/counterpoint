@@ -37,11 +37,13 @@ if [ -t 0 ]; then
   exit 2
 fi
 
-out="$(mktemp)"
+# mktemp with no template is a GNU extension; BSD mktemp exits on it, which
+# would have made every Codex call fail on a stock Mac. cp_mktemp passes one.
+out="$(cp_mktemp out)"
 # The prompt is buffered to a file rather than piped straight through: stdin is a
 # pipe, a retry cannot re-read it, and the second attempt would otherwise reach
 # Codex empty.
-prompt_file="$(mktemp)"
+prompt_file="$(cp_mktemp prompt)"
 trap 'rm -f "$out" "$prompt_file"' EXIT
 cat > "$prompt_file"
 

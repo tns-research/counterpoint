@@ -502,7 +502,10 @@ the turns that warrant it. A reliable "is this a task turn" detector is unsolved
 and deliberately not attempted here. The CLI (bundled scripts plus `counterpoint-run.sh`) is the
 chosen surface; an MCP wrapper was considered and dropped, since the CLI plus the
 `Stop` hook already enforces the loop. Supported on Linux and macOS with one
-shared codebase. Each turn makes one or more CLI calls to Codex on the ChatGPT
+shared codebase, where macOS means a stock Mac (bash 3.2, BSD userland, no
+`timeout(1)`) rather than one already fixed up with Homebrew; run
+`scripts/counterpoint-doctor.sh` to see what a given machine will and will not
+do. Each turn makes one or more CLI calls to Codex on the ChatGPT
 subscription, so expect a multi-minute turn, and more in full mode because of the
 extra planning pass. Three things keep that from growing without bound: the plan
 call overlaps Opus's own drafting (`--launch`/`--collect`), the code review runs

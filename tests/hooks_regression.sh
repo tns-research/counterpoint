@@ -22,7 +22,7 @@ fail=0
 ok() { if [ "$2" = "$3" ]; then echo "PASS: $1"; pass=$((pass + 1)); else echo "FAIL: $1 (want $3, got $2)"; fail=$((fail + 1)); fi; }
 run_stop() { local p="${1:-}"; [ -n "$p" ] || p='{}'; printf '%s' "$p" | bash "$STOP" >/dev/null 2>&1; echo $?; }
 
-work="$(mktemp -d)"
+work="$(mktemp -d "${TMPDIR:-/tmp}/counterpoint-test.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 export COUNTERPOINT_HOME="$work"
 reset() { rm -rf "${work:?}"/* 2>/dev/null || true; }

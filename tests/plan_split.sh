@@ -23,7 +23,7 @@ fail=0
 ok() { if [ "$2" = "$3" ]; then echo "PASS: $1"; pass=$((pass + 1)); else echo "FAIL: $1 (want $3, got $2)"; fail=$((fail + 1)); fi; }
 contains() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 
-work="$(mktemp -d)"
+work="$(mktemp -d "${TMPDIR:-/tmp}/counterpoint-test.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
 fakebin="$work/bin"
@@ -107,6 +107,30 @@ run3="$(printf '%s' "$out" | sed -n 's/^run dir: //p')"
 # --collect refuses a run that was never launched, instead of hanging on it.
 bash "$plan_sh" --collect --run "$run3" --opus-plan "$work/opus-plan.txt" >/dev/null 2>&1
 ok "collect refuses a non-launched run" "$?" 2
+
+# --- a background job that died without writing its result -------------------
+# The backstop clock is the Codex bound times the attempts plus slack, so a job
+# killed by the OS, a closed terminal, or a stray kill used to leave --collect
+# waiting out that whole window on a pid that no longer exists. It should notice
+# the pid is gone and fail immediately instead.
+export COUNTERPOINT_FAKE_SLEEP=60
+out="$(bash "$plan_sh" --launch --task t --prompt "$work/prompt.txt" 2>/dev/null)"
+run4="$(printf '%s' "$out" | sed -n 's/^run dir: //p')"
+dead_pid="$(tr -d '[:space:]' < "$run4/.launch.pid")"
+kill -9 "$dead_pid" 2>/dev/null
+# Kill the codex the launcher spawned too, so nothing survives to write .launch.rc.
+pkill -9 -f "COUNTERPOINT_FAKE_SLEEP" 2>/dev/null
+sleep 1
+started="$(date +%s)"
+err="$(bash "$plan_sh" --collect --run "$run4" --opus-plan "$work/opus-plan.txt" 2>&1 >/dev/null)"; code=$?
+elapsed=$(( $(date +%s) - started ))
+ok "collect fails on a dead background job" "$code" 2
+if [ "$elapsed" -le 10 ]; then ok "collect gives up fast rather than waiting out the backstop" fast fast
+else ok "collect gives up fast rather than waiting out the backstop" "${elapsed}s" fast; fi
+contains "$err" "is gone and wrote no result" \
+  && ok "the failure names the dead job" yes yes \
+  || ok "the failure names the dead job" "$err" yes
+unset COUNTERPOINT_FAKE_SLEEP
 
 echo
 echo "== $pass passed, $fail failed =="

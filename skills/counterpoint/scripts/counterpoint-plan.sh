@@ -100,11 +100,22 @@ if [ "$phase" = "collect" ]; then
 
   pending="$run/.plan_codex.pending"
   plan_codex="$run/plan_codex.txt"
-  # The background job self-bounds via cp_codex_exec, so this only needs slack on
-  # top of that bound before it gives up on a job that vanished.
+  launch_pid="$(tr -d '[:space:]' < "$run/.launch.pid" 2>/dev/null || echo "")"
+  # The background job self-bounds via cp_codex_exec, so the clock is only the
+  # backstop for a job that vanished without writing .launch.rc.
   max_wait=$(( ${COUNTERPOINT_CODEX_TIMEOUT:-600} * (1 + ${COUNTERPOINT_CODEX_RETRIES:-1}) + 120 ))
   waited=0
   while [ ! -f "$run/.launch.rc" ]; do
+    # A killed background job (the terminal closed, the OS reclaimed it, an
+    # errant kill) never writes .launch.rc, and waiting out the full backstop
+    # then meant blocking the turn for twenty minutes on a process that no
+    # longer exists. If the pid is gone and the rc file still is not there,
+    # nothing is coming: fail now and say why.
+    if [ -n "$launch_pid" ] && ! kill -0 "$launch_pid" 2>/dev/null; then
+      sleep 1   # a last-moment writer beats the race
+      [ -f "$run/.launch.rc" ] && break
+      die "the background plan job (pid $launch_pid) is gone and wrote no result; re-launch. See $run/plan_codex.stderr"
+    fi
     if [ "$waited" -ge "$max_wait" ]; then
       die "background plan did not finish within ${max_wait}s; see $run/plan_codex.stderr"
     fi
@@ -132,7 +143,7 @@ if [ "$phase" = "collect" ]; then
     echo "  \"phase\": \"plan\","
     echo "  \"split\": true,"
     echo "  \"launched_at\": \"$(cp_jstr "$launched_at")\","
-    echo "  \"opus_plan_mtime\": \"$(cp_jstr "$(date -r "$opus_plan" +%s 2>/dev/null || echo unknown)")\","
+    echo "  \"opus_plan_mtime\": \"$(cp_jstr "$(cp_mtime "$opus_plan")")\","
     echo "  \"task\": \"$(cp_jstr "$(cat "$run/task" 2>/dev/null || echo "")")\","
     echo "  \"codex_ok\": $([ "$codex_ok" = 1 ] && echo true || echo false)"
     echo "}"
