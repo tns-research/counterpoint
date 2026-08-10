@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# counterpoint-plan.sh: the full-mode joint-planning front-end.
+# counterpoint-plan.sh: the full-mode joint-planning front-end (v2 hardening,
+# see eng/07-hardening-command-and-enforcement.md).
 #
 # In full mode both models plan independently against the same context, the
 # divergence between the plans is the audit signal, and only the reconciled plan

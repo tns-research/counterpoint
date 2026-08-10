@@ -29,7 +29,7 @@ fi
 out="$(mktemp)"
 trap 'rm -f "$out"' EXIT
 
-# Parity contract, and the gVisor hang fix: a read-only critic must
+# Parity contract, and the gVisor hang fix (see eng/07): a read-only critic must
 # reason from the inlined parity context only. The user's config.toml
 # can register MCP servers (e.g. a Zo web-search server) whose web tools Codex may
 # call mid-critique; under a networkless sandbox those calls hang and burn the whole

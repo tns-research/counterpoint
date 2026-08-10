@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# counterpoint-run.sh: the encapsulating command.
+# counterpoint-run.sh: the encapsulating command (v2 hardening, see
+# eng/07-hardening-command-and-enforcement.md).
 #
 # This command owns the part of the loop that must not be faked or skipped: it
 # re-resolves the parity context from source (the command reads the files, not

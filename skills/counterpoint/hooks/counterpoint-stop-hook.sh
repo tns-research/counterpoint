@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# counterpoint-stop-hook.sh: the enforcement backstop.
+# counterpoint-stop-hook.sh: the v2 enforcement backstop (see eng/07).
 #
 # Claude Code runs this when Opus tries to end the turn. The UserPromptSubmit
 # hook injects the pipeline directive at the START; this Stop hook verifies at the

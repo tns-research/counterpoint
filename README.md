@@ -97,8 +97,9 @@ In full mode the arbitration step decides who produces by **scoring the two
 plans**. Each plan is scored on a fixed five-criterion rubric (constraint
 coverage, critical-path correctness, load-bearing specificity, off-path risk
 handling, decision-level information gain), 0 to 2 each, and **Opus scores both**
-(one cited line per cell, so padding is visible). The author of the higher plan
-produces while the other critiques, and a genuine tie goes to Opus, since the
+(one cited line per cell, so padding is visible). The author of the higher total
+produces while the other critiques, with any margin counting: a one-point lead
+already routes production, and only an exact tie goes to Opus, since the
 live in-session process takes the operational edge on a dead heat. The aim is
 **equal opportunity rather than a forced 50/50 split**: Codex's plan can win
 production whenever it is clearly better, and Codex shapes every turn anyway

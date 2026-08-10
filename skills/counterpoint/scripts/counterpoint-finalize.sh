@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# counterpoint-finalize.sh: the deliver-phase artifact writer.
+# counterpoint-finalize.sh: the deliver-phase artifact writer (v2 hardening, see
+# eng/07-hardening-command-and-enforcement.md, F5).
 #
 # counterpoint-run.sh audits the PRE-revision draft: it saves that draft as
 # draft.md and leaves result.md unwritten, with the role log carrying placeholder

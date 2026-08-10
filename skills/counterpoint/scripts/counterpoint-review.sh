@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# counterpoint-review.sh: the full-mode F3 gate, the reconciled-plan review.
+# counterpoint-review.sh: the full-mode F3 gate, the reconciled-plan review
+# (v2 hardening, see eng/07-hardening-command-and-enforcement.md).
 #
 # Reconciliation (step F2, part 3) merges the two independent plans into one
 # agreed plan. That merge is the live Opus's own work, so it can carry a step

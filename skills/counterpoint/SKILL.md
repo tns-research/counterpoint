@@ -132,24 +132,32 @@ The rubric scores plan quality, not task domain, so it applies the same way to
 code, prose, research, and marketing.
 
 Opus scores alone, and it is an interested party (it wrote one of the plans), so
-it carries a known self-preference lean of about a point: at a marginal near-win
-for Codex, Opus may pull the score back to a tie. That lean is accepted, not
-corrected, for two reasons. First, the target is equal opportunity, and a
-*clearly* better Codex plan wins by more than a one-cell lean, so the door stays
-open where it matters. Second, a genuine tie goes to Opus anyway (Part 2), so the
-near-win band the lean touches is already conceded to the live session;
-correcting it would cost an extra Codex scoring pass to change only the marginal
-cases the tiebreak already resolves the same way. (An earlier design had both
-models score both plans blind and averaged the totals to cancel the lean; it was
-dropped as cost that buys only the margin.)
+it carries a known self-preference lean of about a point. That lean is expressed
+**once**, inside the cell scores: when Opus is genuinely torn on a criterion for
+Codex's plan, it may land on the lower value for that cell. Once the five cells
+are totaled, the totals are final and decide the producer directly (Part 2). The
+lean is never re-applied to the totals afterward. A one-point gap is a real lead
+that the tie rule does not touch, and re-reading such a gap as a tolerance band
+("close enough, call it a tie") counts the lean twice: that is the exact bug this
+rule forbids. The lean is accepted at the cell level rather than corrected because
+the target is equal opportunity: a clearly better Codex plan wins by more than a
+one-cell lean, and a genuine dead heat already goes to Opus (Part 2), so the only
+cases the lean touches are the ones the tiebreak resolves the same way. (An
+earlier design had both models score both plans blind and averaged the totals to
+cancel the lean; it was dropped as cost that buys only the margin.)
 
-**Part 2, decide the producer from the totals.** Two conditions, nothing else:
+**Part 2, decide the producer from the totals.** The totals as scored are
+authoritative. Two conditions, nothing else:
 
-- **Higher total produces**, the other reviews and critiques.
-- **Tie -> Opus produces.** On an exact dead heat the turn stays on the live,
-  in-session process. Opus is already the finalizer (Config A), so a tie keeps
-  production and finalization on one process rather than splitting them for no
-  quality gain. An honest routing default, not a bias fix.
+- **Higher total produces**, the other reviews and critiques. Any margin counts:
+  a 10 to 9 result routes production to the author of the 10. There is no
+  tolerance band around the tie, so a one-point lead already wins production
+  outright.
+- **Exact tie -> Opus produces.** Only equal totals are a tie. On a dead heat the
+  turn stays on the live, in-session process: Opus is already the finalizer
+  (Config A), so a tie keeps production and finalization on one process. It is an
+  honest routing default that happens to save a split, and its purpose is routing
+  rather than bias correction.
 
 **Codex's read-only status in planning and critique does not constrain
 production.** Read-only is the *critic's* sandbox (`codex-consult.sh` runs
@@ -279,7 +287,7 @@ Run the critic:
 
 ## Step 4, settle disagreements on the verification ladder
 
-Use the highest rung available. For every flagged issue:
+Use the highest rung available (see eng/03). For every flagged issue:
 
 1. **Hard verifier (code only).** Run the tests, the build, the type checker,
    the linter. A flagged issue that breaks one of these must be fixed; the
@@ -380,7 +388,7 @@ artifact (`log.txt`) and `result.md` exist, so neither the critique nor the
 revision can be silently skipped. The `--verifier` command is judged by its exit code, so do not mask it
 behind a pipe (e.g. `... | tail`), or a failing check will read as a pass. When
 Codex holds the producer role, use `scripts/codex-produce.sh` (text emission, or
-`--write DIR` for heavy multi-file production).
+`--write DIR` for heavy multi-file production). Full design: `eng/07`.
 
 In **full mode** three phases are enforced, on one unified rule: **every point
 where an out-of-session Codex call is required must leave a per-turn artifact, so

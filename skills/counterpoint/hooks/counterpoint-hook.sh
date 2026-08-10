@@ -46,7 +46,7 @@ case "$mode" in
 esac
 
 # Stamp a fresh turn id every prompt so the run command and the Stop hook always
-# see the CURRENT turn. One stamp per user prompt.
+# see the CURRENT turn (v2 enforcement, see eng/07). One stamp per user prompt.
 mkdir -p "$home"
 turn_id="$(date +%s%N)-$$"
 printf '%s\n' "$turn_id" > "$home/current-turn"
