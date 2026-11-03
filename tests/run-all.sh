@@ -3,11 +3,12 @@
 # fake binary on PATH, so the suite costs nothing and needs no subscription.
 #
 # Run: bash tests/run-all.sh   (exit 0 = all green)
+# Every sibling *.sh file is discovered below, so adding a test file wires it in.
 #
 # The suite runs twice when it can. The second pass shims `bash` on PATH to a
 # bash 3.2 if one is installed, which is what macOS ships as /bin/bash and what
 # `env bash` finds on a Mac with no newer bash ahead of it. Shimming PATH rather
-# than threading an interpreter variable through eight files reproduces the Mac
+# than threading an interpreter variable through every test file reproduces the Mac
 # faithfully: the shebangs resolve to 3.2, and so does every `bash "$script"`
 # inside a test. Point COUNTERPOINT_TEST_BASH32 at a build to force one; the
 # second pass is skipped with a note when no 3.2 is around, so this never fails
@@ -19,7 +20,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 run_suite() {
   local failed=0 t
   for t in "$here"/*.sh; do
-    case "$t" in */run-all.sh) continue ;; esac
+    case "$t" in */run-all.sh|*/helpers.sh) continue ;; esac
     echo "=== $(basename "$t")"
     bash "$t" || failed=1
     echo

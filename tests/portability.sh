@@ -9,7 +9,7 @@
 #   the heredoc failed, the hook still exited 0, and the loop silently never ran.
 #   `mktemp` with no template (GNU-only) exits with a usage error on BSD, which
 #   would have killed every Codex call at its first line.
-#   No timeout(1) meant the time bound, the whole reason counterpoint-lib.sh
+#   No timeout(1) meant the time bound, the whole reason lib/core.sh
 #   exists, degraded to a printed warning on exactly the platform it was needed.
 #
 # Two layers, because neither alone is enough. The grep layer catches a GNU-ism
@@ -25,11 +25,11 @@ bad()  { fail=$((fail+1)); printf '  FAIL %s\n' "$1"; }
 check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (want '$3', got '$2')"; fi; }
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-lib="$repo/skills/counterpoint/scripts/counterpoint-lib.sh"
+lib="$repo/skills/counterpoint/lib/core.sh"
 self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 # This file is excluded from its own scan: it names every banned spelling on
 # purpose, both in the patterns and in the BSD stubs that emulate them.
-sh_files="$(find "$repo/skills" "$repo/tests" -name '*.sh' -type f | grep -v "^$self\$" | sort)"
+sh_files="$( { find "$repo/skills" "$repo/tests" "$repo/tools" -name '*.sh' -type f -not -path '*/corpus/*'; echo "$repo/skills/counterpoint/bin/counterpoint"; } | grep -v "^$self\$" | sort)"
 
 # A hit is real code, not a comment about it, and not a line that explicitly
 # declares itself a guarded fallback. cp_mtime has to name `stat -c` somewhere:
@@ -179,8 +179,23 @@ check "cp_mktemp works under BSD mktemp" "$got" "file"
 got="$(PATH="$bsd_path" bash -c ". '$lib'; d=\"\$(cp_mktemp_d t)\"; [ -d \"\$d\" ] && echo dir; rmdir \"\$d\"" 2>&1)"
 check "cp_mktemp_d works under BSD mktemp" "$got" "dir"
 
-# cp_mtime returns a timestamp under BSD stat, not the string "unknown".
+# cp_mtime returns a plausible timestamp under the real host stat. On GNU stat,
+# the BSD spelling can emit non-timestamp output even when it exits successfully,
+# so this pins both validation and the GNU fallback.
 probe="$work/probe"; echo hi > "$probe"
+got="$(bash -c ". '$lib'; cp_mtime '$probe'" 2>&1)"
+case "$got" in
+  ''|*[!0-9]*) bad "cp_mtime under real host stat (want digits, got '$got')" ;;
+  *)
+    if [ "$got" -gt 1000000000 ]; then
+      ok "cp_mtime returns a plausible epoch under real host stat"
+    else
+      bad "cp_mtime under real host stat returned implausible epoch '$got'"
+    fi
+    ;;
+esac
+
+# The existing BSD spelling remains supported too.
 got="$(PATH="$bsd_path" bash -c ". '$lib'; cp_mtime '$probe'" 2>&1)"
 case "$got" in
   ''|*[!0-9]*) bad "cp_mtime under BSD stat (want digits, got '$got')" ;;
@@ -204,13 +219,13 @@ if [ "$a" != "$b" ]; then ok "two turn ids differ"; else bad "two turn ids colli
 hookhome="$work/hookhome"; mkdir -p "$hookhome"
 printf 'small\n' > "$hookhome/mode"
 out="$(printf 'hello' | PATH="$bsd_path" COUNTERPOINT_HOME="$hookhome" \
-  bash "$repo/skills/counterpoint/hooks/counterpoint-hook.sh" 2>&1)"
+  bash "$repo/skills/counterpoint/hooks/prompt.sh" 2>&1)"
 case "$out" in
   *"bad substitution"*) bad "prompt hook hit a bash-4 expansion" ;;
-  *"SMALL depth"*)      ok  "prompt hook injects the directive under BSD userland" ;;
+  *"mode=small"*)      ok  "prompt hook injects the directive under BSD userland" ;;
   *)                    bad "prompt hook printed no directive: $(printf '%s' "$out" | head -1)" ;;
 esac
-stamped="$(cat "$hookhome/current-turn" 2>/dev/null || echo "")"
+stamped="$(cat "$hookhome/sessions/nosession/turn" 2>/dev/null || echo "")"
 case "$stamped" in
   *N-*) bad "hook turn id kept BSD date's literal N: $stamped" ;;
   '')   bad "hook wrote no turn id" ;;
@@ -255,19 +270,19 @@ got="$(PATH="$notimeout" bash -c ". '$lib'; cp_bound 30 -- true; jobs -p | wc -l
 check "cp_bound leaves no background job behind" "$got" "0"
 
 # --- JSON escaping ------------------------------------------------------------
-# cp_jstr fed a backslash used to emit it unchanged, because a gsub replacement
+# cp_json_escape fed a backslash used to emit it unchanged, because a gsub replacement
 # is parsed twice and "\\\\" collapses to one backslash. meta.json then failed
 # to parse for any task naming a path or a regex.
-got="$(bash -c ". '$lib'; cp_jstr 'C:\\tmp \"q\" x'")"
-check "cp_jstr doubles backslashes" "$got" 'C:\\tmp \"q\" x'
+got="$(bash -c ". '$lib'; cp_json_escape 'C:\\tmp \"q\" x'")"
+check "cp_json_escape doubles backslashes" "$got" 'C:\\tmp \"q\" x'
 if command -v python3 >/dev/null 2>&1; then
   probe='a\b "c" 	tab
 newline \\ end'
-  json="{\"t\": \"$(bash -c ". '$lib'; cp_jstr \"\$1\"" _ "$probe")\"}"
+  json="{\"t\": \"$(bash -c ". '$lib'; cp_json_escape \"\$1\"" _ "$probe")\"}"
   if printf '%s' "$json" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
-    ok "cp_jstr output parses as JSON"
+    ok "cp_json_escape output parses as JSON"
   else
-    bad "cp_jstr output is not valid JSON: $json"
+    bad "cp_json_escape output is not valid JSON: $json"
   fi
 fi
 

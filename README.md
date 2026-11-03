@@ -2,304 +2,258 @@
 
 <table>
 <tr>
-<td align="center"><img src="assets/claude.svg" alt="Claude" width="56" height="56"/><br/><sub><b>Claude Opus</b></sub></td>
-<td align="center"><h2>&times;</h2></td>
+<td align="center"><img src="assets/claude.svg" alt="Claude" width="56" height="56"/><br/><sub><b>Claude</b></sub></td>
+<td align="center"><h2>+</h2></td>
 <td align="center"><img src="assets/openai.svg" alt="OpenAI Codex" width="56" height="56"/><br/><sub><b>OpenAI Codex</b></sub></td>
 </tr>
 </table>
 
-# 🎼 counterpoint
+# counterpoint
 
-**Two frontier models, from two labs, reviewing each other before anything ships.**
+### Use Claude and Codex together, in Claude Code.
 
-*Named for the musical form: independent voices, interdependent by design.*
+Two models from two labs catch more mistakes than one.<br/>
+counterpoint makes them work as a team on every task, using the subscriptions you already have.
 
-![Claude Opus](https://img.shields.io/badge/Claude-Opus-D97757?logo=claude&logoColor=white)
+![Claude](https://img.shields.io/badge/Claude-Code-D97757?logo=claude&logoColor=white)
 ![OpenAI Codex](https://img.shields.io/badge/OpenAI-Codex-10A37F?logo=openai&logoColor=white)
-![Two labs](https://img.shields.io/badge/2_labs-Anthropic_%C3%97_OpenAI-8A63D2)
 ![Platform](https://img.shields.io/badge/platform-macOS_%7C_Linux-444?logo=linux&logoColor=white)
-![Status](https://img.shields.io/badge/status-working_MVP-3FB950)
+![Version](https://img.shields.io/badge/version-3.0-8A63D2)
+![License](https://img.shields.io/badge/license-MIT-blue)
 
 </div>
 
-Tired of asking Codex what it thinks of Claude's plan? 🥱 Of copy-pasting a draft
-from one model into the other to ask "where does this fall apart?", reading the
-critique, and pasting it back, every single time? counterpoint does that handoff
-for you, automatically, on every turn inside Claude Code. You keep driving Claude
-Code exactly as you do today; your two AI subscriptions just start talking to each
-other instead of you playing telephone between them.
+## Why two models
 
-Two flagship models from two different labs review each other's work before
-anything ships. Claude Opus (the orchestrator) and OpenAI Codex (reached through
-the `codex exec` CLI on the ChatGPT subscription) take the roles of producer and
-critic, so each turn gets a second, model-diverse pass. Two models with
-different failure modes catch each other's blind spots.
+Every model has blind spots, and a model reviewing its own work shares them. A model trained by another lab makes different mistakes, so it spots the ones yours missed.
 
-> [!IMPORTANT]
-> **counterpoint needs two subscriptions.** 🔌 It runs Claude Opus (on
-> your Claude plan) *and* OpenAI Codex (on your ChatGPT plan) side by side. There
-> is no metered-API path and no OpenAI API key: just the two apps you already pay
-> for, both signed in. With only one of them, the loop cannot run.
+There is a catch. A controlled study on 116 coding tasks found that Codex reviewing Claude's code **lowered** the success rate (91.4% down to 82.8%) when its advice was applied without checking. Claude reviewing Codex raised it (71.6% up to 89.7%).[^1] A second opinion helps only if someone checks it.
 
-> [!NOTE]
-> **What it costs you: time and both subscriptions. Zero metered-API dollars.** 💸
-> - ⏱️ **Time:** expect a turn several minutes longer than plain Claude Code.
->   Each `codex exec` call is a full multi-minute run: **small** mode adds one,
->   **full** mode adds two to three.
-> - 🔋 **Usage:** the baseline 1× is your Claude (Opus) plan; the extra passes
->   bill against your ChatGPT (Codex) plan, so every loop turn spends both at once.
-> - 🟢 **Metered API:** **$0**. No token meter, no surprise bill. Both models run
->   on flat subscriptions.
+counterpoint is built around that result:
 
-## 🎯 What a second model actually catches
+| | |
+|---|---|
+| **Claude does the work** | You keep working in Claude Code as usual. |
+| **Codex reviews it** | In the background, with a precise location and evidence for every problem it raises. |
+| **Serious bugs come with a test** | Codex writes a small test that fails while the bug is there. counterpoint runs it in seconds, so a claim becomes a fact or a false alarm. |
+| **Claude has the last word** | It checks every finding against the code and its tests, then fixes it or rejects it with a reason. Nothing is applied blindly. |
+| **It learns your project** | Rejected findings are remembered, so Codex stops raising them again. |
 
-A single model tends to miss its own blind spots: when it grades its own draft,
-the critique runs on the same weights that wrote it, so it inherits the same
-failure modes. A model from a different lab was trained differently and fails
-differently, so it tends to catch what the first one is structurally likely to
-miss.
+It runs on the Claude and ChatGPT subscriptions you already pay for.
 
-Concretely, in one live run the producer drafted a data audit and called a metric
-"weak". The critic flagged it: the figure was a misleading average across pages,
-and the page that actually mattered was a top result. A plausible, confident,
-wrong conclusion, caught by the second model before it shipped.
+## Quick start
 
-This works because of **context parity**: before it critiques, the second model
-is handed the same prompt, the same resolved AGENTS.md / skill / files, and the
-producer's full output, so it grades against the real constraints instead of a
-summary of them. A constraint the critic never read is a constraint it cannot
-check.
-
-## ⚙️ How it works
-
-One turn, one bounded producer-critic exchange, then it ships the revised result.
-It is a fixed choreography with a predictable cost and latency rather than an open
-"loop until success".
-
-**Small mode is strictly linear and never loops**: Opus produces one draft, Codex
-critiques it once, Opus revises once and ships, even for code with a hard
-verifier. The one step that may repeat is a capped mini-loop (2 to 3 rounds), and
-it is **full mode only**, and only when a hard verifier (tests, build, types)
-gives an objective stop signal.
-
-<div align="center">
-
-![Small mode: the linear cross-criticism pass](assets/diagrams/2-small-loop.png)
-
-</div>
-
-Full mode prepends a joint planning front-end: both models plan independently,
-the divergence between their plans is itself the audit signal, and only the
-reconciled plan feeds the produce-critique-revise pipeline above, where full mode
-adds the capped mini-loop for code.
-
-In full mode the arbitration step decides who produces by **scoring the two
-plans**. Each plan is scored on a fixed five-criterion rubric (constraint
-coverage, critical-path correctness, load-bearing specificity, off-path risk
-handling, decision-level information gain), 0 to 2 each, and **Opus scores both**
-(one cited line per cell, so padding is visible). The author of the higher total
-produces while the other critiques, with any margin counting: a one-point lead
-already routes production, and only an exact tie goes to Opus, since the
-live in-session process takes the operational edge on a dead heat. The aim is
-**equal opportunity rather than a forced 50/50 split**: Codex's plan can win
-production whenever it is clearly better, and Codex shapes every turn anyway
-through its plan, its review of the reconciled plan, and its review of the
-output. Production is decided on plan score alone, with **no capability carve-out
-and no forced quota**: when Codex wins it produces the whole deliverable, code
-included, through `codex-produce.sh --write` with full authorizations, exactly as
-Opus would. The authoritative routing rule lives in one place, `SKILL.md` step
-F2. After the two plans are reconciled into one, and before any of the
-deliverable is written, the model that did *not* win production reviews the
-reconciled plan and the producer arbitrates that review, so a step invented
-during the merge cannot reach production unread. The roles are symmetric, so a
-full turn runs one of two paths, and in Config A the live Opus always does the
-last pass in the session before anything ships:
-
-<div align="center">
-
-![Full mode role assignment: the two symmetric paths](assets/diagrams/4-full-roles.png)
-
-</div>
-
-Disagreements settle on a verification ladder:
-
-1. **Hard verifier** (code only): tests, build, types, linter. A flagged issue
-   that breaks one of these must be fixed; no opinion overrides a failing check.
-2. **Constraint-adherence** (universal): does the draft satisfy each written
-   constraint in the brief, AGENTS.md, and the active skill? This is the
-   semi-objective arbiter for prose, research, and marketing, and it doubles as
-   the mechanism that forces both models to actually follow those instructions.
-3. **Reasoned critique** (fallback): a taste-only issue goes to the finalizer's
-   judgment, with a cited reason. Reliance on this rung is minimized.
-
-## 🎚️ The three modes
-
-The behavior is a single three-position toggle stored in `~/.counterpoint/mode`:
-
-<div align="center">
-
-![The toggle: off, small, full](assets/diagrams/1-toggle.png)
-
-</div>
-
-| Mode | What runs | Rough cost |
-|------|-----------|------------|
-| 🔴 **off** | plain single-model Claude Code (the loop is dormant) | 1× |
-| 🟡 **small** | cross-criticism: produce, critique with context parity, revise, deliver | ~1.5× |
-| 🟢 **full** | small, plus a joint planning front-end: both models plan, Opus scores the two plans to assign the producer, they reconcile into one agreed plan, the non-producer reviews that plan and the producer arbitrates it, then production runs | ~2×+ |
-
-The multipliers are rough. They track the extra model passes a turn adds, one
-cross-critique for small, plus the joint plan and plan review for full, rather
-than a benchmark; a turn is also several minutes longer because each `codex exec`
-call is a full multi-minute run. The baseline 1× is your Claude (Opus) usage; the
-extra passes run on Codex against your ChatGPT subscription, so every loop turn
-spends both plans at once.
-
-Pick **full** for high-stakes turns where starting from a bad plan is expensive
-(architecture, a long document, a multi-step refactor). Pick **small** for an
-ordinary turn where one cross-critique pass is enough. Leave it **off** to get
-ordinary Claude Code back.
-
-## 🚀 Two ways to invoke it
-
-**Manual, per turn.** Type `/counterpoint` (small) or `/counterpoint full` in
-Claude Code, followed by the task. Nothing global changes; only that one turn
-runs the loop.
-
-**Always-on, via the toggle.** Set the mode once and every turn runs the loop at
-that depth until you switch it back, with no slash command typed:
+You need [Claude Code](https://claude.com/claude-code) and the Codex CLI signed in with ChatGPT (`npm i -g @openai/codex`, then `codex login`).
 
 ```bash
-skills/counterpoint/scripts/counterpoint-mode.sh small   # turn it on (cross-criticism)
-skills/counterpoint/scripts/counterpoint-mode.sh full    # joint planning + cross-criticism
-skills/counterpoint/scripts/counterpoint-mode.sh status  # show current mode
-skills/counterpoint/scripts/counterpoint-mode.sh off     # back to plain Claude Code
+git clone https://github.com/tns-research/counterpoint
+mkdir -p ~/.claude/skills
+ln -s "$PWD/counterpoint/skills/counterpoint" ~/.claude/skills/counterpoint
+counterpoint/skills/counterpoint/bin/counterpoint doctor   # checks your setup
 ```
 
-A `UserPromptSubmit` hook (`skills/counterpoint/hooks/counterpoint-hook.sh`)
-reads the toggle on every prompt. When the mode is `off` (or no file exists) and
-no `/counterpoint` is typed, the hook stays silent and the turn is ordinary
-single-model Claude Code. When it is `small` or `full` the hook appends an
-instruction block to the turn, telling the orchestrator to run the skill at that
-depth. When you type `/counterpoint` by hand it does not append that block (the
-slash command already loads the skill), so the manual and always-on paths never
-double-fire.
+Then, in Claude Code:
 
-The critical steps run as scripts that each write a per-turn artifact: the
-critique, and in full mode the joint plan and the plan review. A second `Stop`
-hook (`hooks/counterpoint-stop-hook.sh`) then refuses to end the turn until those
-artifacts exist, so the orchestrator cannot skip the second opinion and claim it
-happened. The toggle is the single source of truth: the `Stop` hook re-reads it
-live every turn, so nothing can go stale and contradict it. A manual
-`/counterpoint` still runs the loop for that turn via the skill, and the `Stop`
-hook backstop is armed by the toggle.
+```text
+/counterpoint fix the timeout parsing in config.sh
+```
 
-## 📦 Install
+Claude does the task, Codex reviews it, and Claude reports what the review changed.
 
-**Requirements:**
+## What a review looks like
 
-- 🔌 **Two active subscriptions.** counterpoint runs Claude Opus and OpenAI Codex
-  side by side, so it draws on a Claude plan (for Opus) and a ChatGPT plan (for
-  Codex) at once. Both must be signed in; there is no metered-API path.
-- 💻 **Linux or macOS.** One shared codebase covers both, and macOS means a stock
-  Mac: bash 3.2 at `/bin/bash`, BSD userland, no Homebrew coreutils. Nothing in
-  the scripts uses bash-4 syntax or a GNU-only flag, and the time bound falls
-  back to a shell watchdog where `timeout(1)` does not exist.
-  `tests/portability.sh` holds that line, and `tests/run-all.sh` re-runs the whole
-  suite under a bash 3.2 when it finds one. Windows is not supported (it would
-  need WSL or a separate runtime).
-- 🩺 **Not sure the machine is ready?** `skills/counterpoint/scripts/counterpoint-doctor.sh`
-  reports the bash version, whether the time bound is enforced by `timeout(1)` or
-  the watchdog, the Codex CLI and its model/effort, whether both hooks are wired,
-  and how much the run archive is holding.
-- 🤖 **Claude Code**, with this skill discoverable (symlink the skill into
-  `~/.claude/skills/`, the repo stays the source of truth):
-  ```bash
-  ln -s "$PWD/skills/counterpoint" ~/.claude/skills/counterpoint
-  ```
-- 🧠 **Codex CLI** signed in on the ChatGPT subscription (`codex login`), so the
-  consult calls cost subscription time and zero metered API tokens. Last tested
-  with `codex-cli` 0.142.4.
+```text
+=== counterpoint review (ok, 42s)
+verdict: fix  |  The script misses the warning for empty values and reads leading zeroes as octal.
 
-For the always-on toggle and the enforcement backstop, register **both** hooks in
-`~/.claude/settings.json` (the `UserPromptSubmit` hook arms and injects the loop;
-the `Stop` hook is what refuses to end a turn that skipped it):
+- F1 [major/correctness] timeout-config.sh:10
+  problem:  Arithmetic expansion reads leading zeroes as octal.
+  evidence: $((timeout_seconds)) prints 8 for JOB_TIMEOUT=0010; the request requires 10.
+  fix:      Strip leading zeroes from the validated string before any arithmetic.
+
+repro F1: REPRODUCED (its test fails on the reviewed code)
+```
+
+Claude fixes it, the test is re-run, and the turn closes with a one-line record of each decision:
+
+```text
+F1 applied (bug test now passes)
+F2 rejected: the cited input is rejected earlier by parse_args (line 40)
+```
+
+## How it works
+
+There are two depths.
+
+### Small (the default): Claude writes, Codex reviews
+
+`/counterpoint <task>`. For everyday changes, about 20 to 50 seconds of Codex time.
+
+<div align="center">
+<img src="assets/diagrams/v3-loop.png" alt="Claude does the work. Codex reviews it in the background while Claude runs its tests. Codex's bug tests run on a copy of the code. Claude checks each finding and fixes or rejects it. The bug tests re-run on the fix." width="420"/>
+</div>
+
+### Full: two plans, two blind judges, the better author writes
+
+`/counterpoint full <task>`. For work where a wrong approach is expensive. Both models act as authors here, and either one can end up writing.
+
+<div align="center">
+<img src="assets/diagrams/v3-full.png" alt="Claude and Codex each plan. Two blind judges, Codex and a fresh Claude session, score both plans. Claude merges the plans. If Codex's plan leads by 2 points per judge, Codex writes and Claude reviews; otherwise Claude writes, Codex reviews with bug tests, Claude fixes and Codex confirms the fixes." width="420"/>
+</div>
+
+1. **Two independent plans.** Codex and Claude each plan the task without seeing the other's plan.
+2. **Two blind judges.** Codex and a fresh Claude session (no tools, no memory of writing either plan) score both plans on five criteria: constraints covered, correctness, specificity, risks handled, and real insight. The plans are shown as A and B in a random order, so neither judge knows which is whose. A model tends to prefer its own style, and two judges from two labs cancel that out.
+3. **Merge.** Claude merges the two plans, starting from the stronger one and fixing the issues the judges found.
+4. **The better author writes.** If Codex's plan leads by 2 points or more per judge, Codex writes and Claude reviews its work, the direction the study found strongest. Otherwise Claude writes and Codex reviews, with bug tests.
+5. **Codex rechecks the fixes** in its own review thread, in seconds. The turn cannot close without this recheck. If Codex says a fix did not work, Claude fixes it again and rechecks, or records why Codex is wrong.
+
+About 6 minutes in our end-to-end run, most of it the review.
+
+In both modes, the turn cannot close until every finding has a decision, and a bug proven by a test cannot be marked fixed while its test still fails. If Codex is down, the work can still ship, and the record says it went unreviewed.
+
+## Speed
+
+Measured with the real Codex on 2026-11-03, small runs on the same task with and without bug tests.
+
+| | Time |
+|---|---|
+| Small review, bug tests off | 22 to 31 s |
+| Small review, bug tests on (3 bugs found, 3 tests written) | 40 to 47 s |
+| Running the bug tests | about 1 s |
+| Full, a complete Claude Code task end to end (an atomic file update, bash) | 349 s: plans 35 s, two blind judges 48 s, review 124 s, recheck 11 s. Task passed its checker; 2 real bugs fixed |
+
+Most of the gain comes from running Codex in the background while Claude keeps working, handing it the material directly so it does not explore the repo, and reusing its review thread for the final check. `--no-repro` skips the bug tests (about 16 s saved when it finds bugs). `COUNTERPOINT_FAST=1` asks for Codex's faster priority tier, which uses more of your plan.
+
+## Reference
+
+<details>
+<summary><b>Always-on mode (hooks)</b></summary>
+
+To run every turn through counterpoint without typing `/counterpoint`, register the two hooks in `~/.claude/settings.json`:
 
 ```json
 {
   "hooks": {
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/absolute/path/to/counterpoint/skills/counterpoint/hooks/counterpoint-hook.sh"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/absolute/path/to/counterpoint/skills/counterpoint/hooks/counterpoint-stop-hook.sh"
-          }
-        ]
-      }
-    ]
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "/abs/path/counterpoint/skills/counterpoint/hooks/prompt.sh" }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "/abs/path/counterpoint/skills/counterpoint/hooks/stop.sh" }] }]
   }
 }
 ```
 
-With both hooks registered and the mode left at `off`, nothing changes until you
-flip the toggle, so installing it is safe. ✅
+Then switch with `counterpoint mode small`, `full` or `off`. With the mode `off`, nothing changes.
 
-## 🗂️ Repo layout
+When the mode is on, the first attempt to end a turn that was neither reviewed nor skipped is refused. A second attempt goes through and is logged in `~/.counterpoint/escapes.log`, so a session can never get stuck.
+
+</details>
+
+<details>
+<summary><b>Commands</b></summary>
+
+Claude runs these for you. They also work on their own (optionally link `bin/counterpoint` into your `PATH`).
+
+| Command | What it does |
+|---|---|
+| `start small` or `start full` | open a turn for a new task, at that depth |
+| `review --diff` or `--draft FILE` | Codex reviews the work. `--brief`/`--ask` give it the request, `--context` the constraints, `--plan` the agreed plan, `--bg` runs it in the background |
+| `plan --brief FILE` | Codex plans independently (full mode) |
+| `compare --mine FILE --brief FILE` | two blind judges (Codex and a fresh Claude session) score both plans and name who writes (full mode) |
+| `produce --brief FILE [--write DIR]` | Codex writes the deliverable (full mode, when its plan is better) |
+| `wait` | collect a background run and print it |
+| `verify` | re-run the bug tests on the fixed code |
+| `recheck --diff --ledger FILE` | Codex confirms the fixes in its own thread (full mode) |
+| `done --final FILE --ledger FILE` | close the turn (full mode: `--keep-producer "why"` if Claude wrote although Codex's plan won) |
+| `skip "reason"` | close a turn with nothing to review (a question, a discussion) |
+| `status` | the current turn's Codex runs |
+| `log` | your last turns: findings raised, applied, rejected, Codex time |
+| `stats [--all]` | how often each category of finding held up in this project |
+| `forget` | clear this project's finding history |
+| `doctor` | check the setup |
+| `gc [DAYS]` | delete turn records older than 30 days |
+
+Each task starts with `counterpoint start small|full`, which Claude runs for you. Inside Claude Code, every later command belongs to that turn of its own session, so tasks and parallel sessions never mix. Outside it, pass `--turn ID`.
+
+`done` refuses to close when a finding has no decision, a rejection has no reason, a reproduced bug is marked fixed but its test fails or was never re-run, the latest review failed or is still running, a fix Codex's recheck disputes is still marked applied, or, in full mode, the plans were never compared, the chosen author did not write, or the fixes were never rechecked. `--unreviewed "<why>"` ships anyway and says so in the record.
+
+</details>
+
+<details>
+<summary><b>Configuration</b></summary>
+
+| Variable | Default | |
+|---|---|---|
+| `COUNTERPOINT_MODEL` | Codex's default | any model your Codex lists |
+| `COUNTERPOINT_EFFORT` | per phase | force one reasoning effort for every call (defaults: review `medium`, `high` in full mode; plan and compare `medium`; recheck `low`) |
+| `COUNTERPOINT_FAST` | `0` | `1` requests the priority (fast) tier |
+| `COUNTERPOINT_CODEX_MARGIN` | `2` | points per judge by which Codex's plan must lead for Codex to write |
+| `COUNTERPOINT_CLAUDE_JUDGE` | `1` | `0` leaves the plan comparison to Codex alone |
+| `COUNTERPOINT_CLAUDE_JUDGE_MODEL` | Claude Code's default | model for the blind Claude judge |
+| `COUNTERPOINT_CODEX_TIMEOUT` | `600` | seconds per Codex call; a timeout is never retried |
+| `COUNTERPOINT_CODEX_RETRIES` | `1` | retries after a transient failure |
+| `COUNTERPOINT_CODEX_ENV_PASSTHROUGH` | | extra variable names Codex and the bug tests may see |
+| `COUNTERPOINT_REPRO` | `1` | `0` turns bug tests off (same as `--no-repro`) |
+| `COUNTERPOINT_REPRO_TIMEOUT` | `30` | seconds per bug test |
+| `COUNTERPOINT_MEMORY` | `1` | `0` stops showing Codex past rejections (same as `--no-memory`) |
+| `COUNTERPOINT_MEMORY_ITEMS` | `20` | how many past rejections a review is shown |
+| `COUNTERPOINT_HOME` | `~/.counterpoint` | where turns, the log and the project history live |
+
+</details>
+
+<details>
+<summary><b>Security and privacy</b></summary>
+
+- Codex starts with an empty environment (only `HOME`, `PATH`, the locale and `CODEX_HOME`). Your exported keys and tokens never reach it unless you name them in the passthrough.
+- It runs with `--ignore-user-config`, so MCP servers from your Codex config cannot be called during a review.
+- Review, plan and recheck are read-only. Only `produce --write DIR` lets Codex edit files, and where Codex's own sandbox cannot start (some containers) it refuses unless you pass `--allow-bypass`.
+- Bug tests are code written by Codex, so they always run in a throwaway copy of your project (the files git tracks, with `node_modules`, `.venv`, `venv` and `vendor` linked in), with the same empty environment and a 30 s limit. They have no sandbox beyond that: use `--no-repro` where running reviewer-written tests is not acceptable.
+- The blind Claude judge in full mode runs as `claude -p` with no tools, no MCP servers, no settings or hooks, and no session saved. It only reads the two plans and the request.
+- The project history stays on your machine, in `~/.counterpoint/projects/`, outside the repo.
+- Codex sees what you hand it: the request, the context files and the work. Keep secrets out of them.
+
+</details>
+
+<details>
+<summary><b>Requirements and platforms</b></summary>
+
+Linux or macOS, including a stock Mac (bash 3.2, BSD tools, no `timeout`). Full mode's second judge uses the `claude` CLI that comes with Claude Code. Bug tests, project memory and plan scoring need `python3` or `jq` (macOS 15 ships `jq`); without either they switch themselves off. `counterpoint doctor` shows what your machine will do.
+
+</details>
+
+<details>
+<summary><b>How it is tested</b></summary>
+
+- About 200 offline checks run against a fake `codex` and a fake `claude`, so they cost nothing: every command, the decision rules, the bug tests (reproduced, not reproduced, broken, slow, secrets kept out, real project untouched), the memory, the plan comparison and its gates, the hooks, timeouts and retries. `tests/run-all.sh` runs them under your bash and again under bash 3.2 as shipped on macOS.
+- A portability check rejects GNU-only flags and bash 4 syntax.
+- Live runs with the real Codex and Claude Code, in small and full mode, on tasks with an automatic checker. The speed numbers above come from them. counterpoint also reviewed its own code before this release: Codex found and proved 3 real bugs, which were fixed.
+
+</details>
+
+<details>
+<summary><b>Repo layout</b></summary>
 
 ```
 skills/counterpoint/
-  SKILL.md                        the producer-critic pipeline (small + full)
-  scripts/codex-consult.sh        one read-only Codex pass, prompt on stdin, MCP disabled
-  scripts/codex-produce.sh        Codex in producer mode (text with MCP disabled, or --write DIR)
-  scripts/counterpoint-plan.sh    full mode F1: the joint plan, enforced
-  scripts/counterpoint-review.sh  full mode F3: the reconciled-plan review, enforced
-  scripts/counterpoint-run.sh     the critique half, enforced (writes draft.md + log.txt)
-  scripts/counterpoint-finalize.sh records the revised deliverable (writes result.md)
-  scripts/counterpoint-mode.sh    the off/small/full toggle CLI
-  scripts/counterpoint-lib.sh     the shared floor: time bound, retry, sandbox probe, JSON
-  scripts/counterpoint-doctor.sh  what this machine will actually do, before a turn needs it
-  hooks/counterpoint-hook.sh      the UserPromptSubmit hook: arms + injects
-  hooks/counterpoint-stop-hook.sh the Stop hook: refuses to end until artifacts exist
-tests/                            dependency-free regression tests, run them with
-                                  tests/run-all.sh (twice, if a bash 3.2 is around)
+  SKILL.md          the loop, as Claude follows it (one page)
+  bin/counterpoint  the CLI: every command above
+  lib/core.sh       time limits, retries, empty environment, sandbox check, findings as data
+  prompts/          instructions for the reviewer, planner, recheck, producer and bug tests
+  schemas/          the JSON shapes Codex must answer in
+  hooks/            prompt.sh (starts a turn), stop.sh (one refusal, then a logged escape)
+tests/              offline suite behind a fake codex; run-all.sh replays it under bash 3.2
 ```
 
-## ✅ Status
+</details>
 
-Working, and hardened past the MVP it started as. Both modes run, both invocation
-paths (manual slash command and always-on hook) are wired, and each turn makes
-one or more real `codex exec` calls on the ChatGPT subscription. The enforced
-loop has been run live and hook-driven on real tasks: a full-mode data audit
-where both the joint plan and the cross-model critique caught real defects, and a
-run with Codex as the file-writing producer.
+<details>
+<summary><b>Upgrading from v2</b></summary>
 
-Every Codex call is now time-bounded and retried once on a transient failure, and
-each phase writes an `ok` marker only when the call produced something usable, so
-a stalled or empty pass fails the turn instead of leaving behind a clean-looking
-set of artifacts. The joint plan runs in the background while the orchestrator
-writes its own, and on code tasks `codex exec review` runs alongside the
-critique. A measured full-mode turn came in at 3 min 35 s end to end, of which
-2 min 12 s was Codex latency, against a 6.5-minute median before that work.
+v3 replaces the nine `scripts/counterpoint-*.sh` commands with one `bin/counterpoint`, free-text critiques with structured findings and a decision record, and the plan scoring and separate plan-review call with `compare`, where two blind judges (Codex and a fresh Claude session) pick who writes. It adds bug tests, project memory and a required recheck of the fixes in full mode. Point your hooks at `hooks/prompt.sh` and `hooks/stop.sh`. Old runs under `~/.counterpoint/runs/` are left untouched.
 
-The suite is 94 assertions across 7 files, dependency-free behind a fake `codex`
-binary, and `tests/run-all.sh` replays all of it a second time under a bash 3.2
-when it finds one. macOS is held by that replay plus BSD stubs rather than by a
-real Mac, which is worth knowing before trusting it on one. The CLI is the chosen
-surface; an MCP wrapper was considered and dropped, since the CLI plus the `Stop`
-hook already enforces the loop.
+</details>
 
 ## License
 
-counterpoint is released under the [MIT License](./LICENSE). Copyright (c)
-2026 tns-research.
+[MIT](./LICENSE). Copyright (c) 2026 tns-research.
+
+The name comes from music: independent voices that sound better together.
+
+[^1]: Xiang et al., *Cross-Model LLM Code Review: Should you use Claude to review Codex or vice versa?*, Agentic SE @ KDD'26, [arXiv:2607.21656](https://arxiv.org/abs/2607.21656).

@@ -1,0 +1,1079 @@
+#!/usr/bin/env bash
+# counterpoint: one CLI for the two-model loop (Claude produces, Codex reviews).
+# Run `counterpoint help` for the commands. Linux and stock macOS (bash 3.2).
+set -uo pipefail
+
+SELF="$0"
+case "$SELF" in /*) ;; *) SELF="$(cd "$(dirname "$SELF")" && pwd)/$(basename "$SELF")" ;; esac
+# Resolve a symlinked install (e.g. ~/.local/bin/counterpoint) to the skill dir.
+src="$SELF"
+while [ -L "$src" ]; do
+  link="$(readlink "$src")"
+  case "$link" in /*) src="$link" ;; *) src="$(dirname "$src")/$link" ;; esac
+done
+SKILL_DIR="$(cd "$(dirname "$src")/.." && pwd)"
+# shellcheck source=../lib/core.sh
+. "$SKILL_DIR/lib/core.sh"
+
+CP_HOME="${COUNTERPOINT_HOME:-$HOME/.counterpoint}"
+case "$CP_HOME" in /*) ;; *) CP_HOME="$PWD/$CP_HOME" ;; esac
+VERSION="3.0.0"
+
+die() { echo "counterpoint: $*" >&2; exit 2; }
+say() { echo "counterpoint: $*" >&2; }
+
+# --- turn resolution ------------------------------------------------------------
+# --turn wins, then COUNTERPOINT_TURN, then the turn the prompt hook stamped for
+# this Claude Code session (CLAUDE_CODE_SESSION_ID is exported to every Bash call,
+# so concurrent sessions never collide), then a per-day manual turn.
+sid_of() { printf '%s' "${1:-}" | LC_ALL=C tr -cd 'A-Za-z0-9._-' | cut -c 1-64; }
+resolve_turn() {
+  local t="${OPT_TURN:-${COUNTERPOINT_TURN:-}}" sid
+  if [ -z "$t" ]; then
+    sid="$(sid_of "${CLAUDE_CODE_SESSION_ID:-}")"
+    [ -n "$sid" ] && [ -f "$CP_HOME/sessions/$sid/turn" ] && t="$(head -1 "$CP_HOME/sessions/$sid/turn")"
+  fi
+  [ -n "$t" ] || t="manual-$(date +%Y%m%d)"
+  t="$(sid_of "$t")"
+  TURN="$t"
+  TURN_DIR="$CP_HOME/turns/$t"
+  mkdir -p "$TURN_DIR/runs" || die "cannot create $TURN_DIR"
+  [ -f "$TURN_DIR/mode" ] || echo manual > "$TURN_DIR/mode"
+  TURN_MODE="$(head -1 "$TURN_DIR/mode")"
+}
+
+# --- options ----------------------------------------------------------------------
+OPT_TURN=""; OPT_BRIEF=""; OPT_ASK=""; OPT_PLAN=""; OPT_BG=0; OPT_EFFORT=""
+OPT_DIFF=0; OPT_BASE=""; OPT_DIR="$PWD"; OPT_FINAL=""; OPT_LEDGER=""; OPT_WRITE=""
+OPT_ALLOW_BYPASS=0; OPT_UNREVIEWED=""; OPT_SKIP=""; OPT_FOCUS=""; OPT_ALL=0
+OPT_MINE=""; OPT_THEIRS=""; OPT_KEEP=""
+CONTEXT=(); WORK=(); POS=()
+parse_opts() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --turn) OPT_TURN="$2"; shift 2 ;;
+      --brief) OPT_BRIEF="$2"; shift 2 ;;
+      --ask) OPT_ASK="$2"; shift 2 ;;
+      --context|-c) CONTEXT+=("$2"); shift 2 ;;
+      --draft|--work|-w) WORK+=("$2"); shift 2 ;;
+      --plan) OPT_PLAN="$2"; shift 2 ;;
+      --mine) OPT_MINE="$2"; shift 2 ;;
+      --theirs) OPT_THEIRS="$2"; shift 2 ;;
+      --keep-producer) OPT_KEEP="$2"; shift 2 ;;
+      --diff) OPT_DIFF=1; shift ;;
+      --base) OPT_DIFF=1; OPT_BASE="$2"; shift 2 ;;
+      --focus) OPT_FOCUS="$2"; shift 2 ;;
+      -C) OPT_DIR="$2"; shift 2 ;;
+      --bg) OPT_BG=1; shift ;;
+      --effort) OPT_EFFORT="$2"; shift 2 ;;
+      --final) OPT_FINAL="$2"; shift 2 ;;
+      --ledger) OPT_LEDGER="$2"; shift 2 ;;
+      --write) OPT_WRITE="$2"; shift 2 ;;
+      --allow-bypass) OPT_ALLOW_BYPASS=1; shift ;;
+      --all) OPT_ALL=1; shift ;;
+      --no-repro) export COUNTERPOINT_REPRO=0; shift ;;
+      --no-memory) export COUNTERPOINT_MEMORY=0; shift ;;
+      --unreviewed) OPT_UNREVIEWED="$2"; shift 2 ;;
+      -h|--help) cmd_help; exit 0 ;;
+      --*) die "unknown option $1 (see: counterpoint help)" ;;
+      *) POS+=("$1"); shift ;;
+    esac
+  done
+}
+
+# --- prompt assembly --------------------------------------------------------------
+emit_file() {
+  local f="$1" max=400000 size
+  [ -f "$f" ] || die "no such file: $f"
+  size="$(wc -c < "$f" | tr -d ' ')"
+  printf '\n### %s\n\n' "$f"
+  if [ "$size" -gt "$max" ]; then
+    head -c "$max" "$f"
+    printf '\n[... truncated: %s of %s bytes shown]\n' "$max" "$size"
+  else
+    cat "$f"
+  fi
+  printf '\n'
+}
+
+# A review of a diff that could not be produced would look clean; refuse instead.
+# The failure is a flag file: a marker string in the prompt could be forged by
+# the diff itself.
+assert_diff_ok() {
+  if [ -f "$RUN/diff.failed" ]; then
+    echo "failed:diff" > "$RUN/status"
+    die "git diff failed in $OPT_DIR; nothing was sent to Codex"
+  fi
+}
+
+check_diff_source() {
+  ( cd "$OPT_DIR" 2>/dev/null || die "-C: no such directory: $OPT_DIR"
+    git rev-parse --git-dir >/dev/null 2>&1 || die "--diff needs a git repository ($OPT_DIR is not one)"
+    if [ -n "$OPT_BASE" ]; then
+      git rev-parse --verify --quiet "$OPT_BASE^{commit}" >/dev/null || die "--base: unknown ref '$OPT_BASE'"
+    fi ) || exit 2
+}
+
+emit_diff() {
+  ( cd "$OPT_DIR" 2>/dev/null || exit 0
+    git rev-parse --git-dir >/dev/null 2>&1 || { echo "(not a git repository: $OPT_DIR)"; exit 0; }
+    printf '\n## Diff under review (%s)\n\n```diff\n' "${OPT_BASE:-uncommitted changes vs HEAD}"
+    if [ -n "$OPT_BASE" ]; then git diff "$OPT_BASE" || : > "$RUN/diff.failed"
+    elif git rev-parse --verify --quiet HEAD >/dev/null; then git diff HEAD || : > "$RUN/diff.failed"
+    else { git diff --cached && git diff; } || : > "$RUN/diff.failed"; fi
+    printf '```\n'
+    local f
+    git ls-files --others --exclude-standard 2>/dev/null | head -50 | while IFS= read -r f; do
+      [ -f "$f" ] && emit_file "$f"
+    done )
+}
+
+# build_prompt KIND > file
+build_prompt() {
+  local kind="$1" f
+  cat "$SKILL_DIR/prompts/$kind.md"
+  printf '\n'
+  cat "$SKILL_DIR/prompts/scaffold.md"
+  [ -n "$OPT_FOCUS" ] && printf '\nFocus for this pass: %s\n' "$OPT_FOCUS"
+  printf '\n## Request\n\n'
+  if [ -n "$OPT_BRIEF" ]; then
+    if [ "$OPT_BRIEF" = "-" ]; then cat; else [ -f "$OPT_BRIEF" ] || die "no such brief: $OPT_BRIEF"; cat "$OPT_BRIEF"; fi
+  fi
+  [ -n "$OPT_ASK" ] && printf '%s\n' "$OPT_ASK"
+  if [ ${#CONTEXT[@]} -gt 0 ]; then
+    printf '\n## Context documents (the constraints the work must satisfy)\n'
+    for f in "${CONTEXT[@]}"; do emit_file "$f"; done
+  fi
+  if [ -n "$OPT_PLAN" ]; then
+    printf '\n## Agreed plan\n'
+    emit_file "$OPT_PLAN"
+  fi
+  if [ ${#WORK[@]} -gt 0 ]; then
+    if [ "$kind" = "recheck" ]; then printf '\n## Revised work\n'; else printf '\n## Work under review\n'; fi
+    for f in "${WORK[@]}"; do emit_file "$f"; done
+  fi
+  [ "$OPT_DIFF" = 1 ] && emit_diff
+  return 0
+}
+
+# --- runs ---------------------------------------------------------------------------
+# A run is one Codex call: runs/<NN>-<kind>/ with prompt.md, cmd (the codex argv,
+# one per line), out (final message), events.jsonl, stderr, status, thread.
+new_run() {
+  local kind="$1" n
+  n="$(ls "$TURN_DIR/runs" 2>/dev/null | wc -l | tr -d ' ')"
+  n=$((n + 1)); [ "$n" -lt 10 ] && n="0$n"
+  RUN="$TURN_DIR/runs/$n-$kind"
+  mkdir -p "$RUN"
+  echo "$kind" > "$RUN/kind"
+  echo pending > "$RUN/status"
+}
+
+default_effort() {
+  case "$1" in
+    review) [ "$TURN_MODE" = full ] && echo high || echo medium ;;
+    plan|compare) echo medium ;;
+    recheck) echo low ;;
+    produce) echo high ;;
+  esac
+}
+
+# codex_args KIND -> writes the argv to $RUN/cmd
+write_cmd() {
+  local kind="$1" effort="${OPT_EFFORT:-${COUNTERPOINT_EFFORT:-$(default_effort "$1")}}"
+  {
+    if [ "$kind" = recheck ]; then
+      echo exec; echo resume; echo "$(cat "$PREV/thread")"
+      echo -c; echo 'sandbox_mode="read-only"'
+    else
+      echo exec
+    fi
+    echo --json; echo --skip-git-repo-check; echo --ignore-user-config
+    echo -o; echo "$RUN/out"
+    if [ "$kind" != recheck ]; then echo --color; echo never; echo -C; echo "$OPT_DIR"; fi
+    case "$kind" in
+      review) echo --output-schema; echo "$SKILL_DIR/schemas/findings.json"; echo -s; echo read-only ;;
+      recheck) echo --output-schema; echo "$SKILL_DIR/schemas/recheck.json" ;;
+      plan) echo --ephemeral; echo -s; echo read-only ;;
+      compare) echo --ephemeral; echo --output-schema; echo "$SKILL_DIR/schemas/compare.json"; echo -s; echo read-only ;;
+      produce)
+        if [ -n "$OPT_WRITE" ]; then
+          if cp_sandbox_usable; then echo -s; echo workspace-write
+          else echo --dangerously-bypass-approvals-and-sandbox; fi
+        else
+          echo --ephemeral; echo -s; echo read-only
+        fi ;;
+    esac
+    if [ -n "${COUNTERPOINT_MODEL:-}" ]; then echo -m; echo "$COUNTERPOINT_MODEL"; fi
+    echo -c; echo "model_reasoning_effort=\"$effort\""
+    if [ "${COUNTERPOINT_FAST:-0}" = 1 ]; then echo -c; echo 'service_tier="priority"'; fi
+    echo -
+  } > "$RUN/cmd"
+  echo "$effort" > "$RUN/effort"
+}
+
+# The job body, run in the foreground or detached by --bg.
+run_job() {
+  local run="$1" args=() line rc=0 t0 t1
+  while IFS= read -r line; do args+=("$line"); done < "$run/cmd"
+  local kind snap="" cwd=""
+  kind="$(cat "$run/kind")"
+  echo running > "$run/status"
+  # The repros must run on the code as it was reviewed, so the copy is taken now,
+  # while Codex reads; the author may already be editing by the time it answers.
+  if [ "$kind" = review ] && [ -f "$run/repro.on" ]; then
+    snap="$(cp_mktemp_d snap)"; cwd="$(snapshot "$(cat "$run/dir")" "$snap")" || cwd=""
+  fi
+  t0="$(date +%s)"; echo "$t0" > "$run/started"
+  local judge_pid=""
+  if [ "$kind" = compare ] && claude_judge_on; then claude_judge "$run" & judge_pid=$!; fi
+  cp_codex_exec "$run/out" "$run/prompt.md" -- "${args[@]}" > "$run/events.jsonl" 2>> "$run/stderr" || rc=$?
+  [ -n "$judge_pid" ] && wait "$judge_pid" 2>/dev/null
+  t1="$(date +%s)"; echo "$t1" > "$run/ended"
+  echo $((t1 - t0)) > "$run/seconds"
+  # Retries append to the same stream; the last thread.started is the attempt that answered.
+  grep '"type":"thread.started"' "$run/events.jsonl" 2>/dev/null | tail -1 | cp_json_string thread_id > "$run/thread" 2>/dev/null || true
+  if [ -n "$snap" ]; then
+    if [ "$rc" = 0 ] && [ -n "$(cp_repro_extract "$run/out" "$run/repro")" ]; then
+      if [ -n "$cwd" ]; then run_repros "$run" before "$cwd"; else run_repros "$run" before; fi
+    fi
+    rm -rf "$snap"
+  fi
+  if [ "$rc" = 0 ] && [ "$kind" = compare ]; then compare_decide "$run" || rc=3; fi
+  if [ "$rc" = 0 ]; then echo ok > "$run/status"
+  elif [ "$rc" = 124 ]; then echo timeout > "$run/status"
+  else echo "failed:$rc" > "$run/status"; fi
+  return "$rc"
+}
+
+start_run() {
+  local kind="$1"
+  write_cmd "$kind"
+  cp_codex_env_prepare
+  if [ "$OPT_BG" = 1 ]; then
+    nohup "$SELF" _job "$RUN" < /dev/null >> "$RUN/stderr" 2>&1 &
+    disown $! 2>/dev/null || true
+    echo "$RUN"
+    say "$kind running in the background ($(basename "$RUN")); keep working, then: counterpoint wait"
+    return 0
+  fi
+  say "$kind running (effort $(cat "$RUN/effort"))..."
+  run_job "$RUN"
+  show_run "$RUN"
+}
+
+# --- rendering ------------------------------------------------------------------------
+render_json() {
+  local f="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -I - "$f" <<'PY' 2>/dev/null && return 0
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(f"verdict: {d.get('verdict','?')}  |  {d.get('summary','')}")
+for u in d.get("unresolved", []):
+    print(f"\n- UNRESOLVED {u['id']}: {u['why']}")
+for x in d.get("findings", []):
+    print(f"\n- {x['id']} [{x['severity']}{'/' + x['category'] if x.get('category') else ''}] {x['where']}\n  problem: {x['problem']}\n  evidence: {x['evidence']}\n  fix: {x['fix']}")
+if not d.get("findings") and not d.get("unresolved"):
+    print("\n(no findings)")
+PY
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '"verdict: \(.verdict)  |  \(.summary)", ((.unresolved // [])[] | "- UNRESOLVED \(.id): \(.why)"), (.findings[] | "- \(.id) [\(.severity)\(if .category then "/" + .category else "" end)] \(.where)\n  problem: \(.problem)\n  evidence: \(.evidence)\n  fix: \(.fix)")' "$f" 2>/dev/null && return 0
+  fi
+  cat "$f"; echo
+}
+
+show_run() {
+  local run="$1" kind status secs
+  kind="$(cat "$run/kind")"; status="$(cat "$run/status")"; secs="$(cat "$run/seconds" 2>/dev/null || echo '?')"
+  echo "=== counterpoint $kind ($status, ${secs}s) $run"
+  if [ "$status" != ok ]; then
+    echo "!!! Codex did not complete this $kind. Last stderr lines:"
+    tail -5 "$run/stderr" 2>/dev/null
+    echo "!!! Re-run the same command. Do not ship as if it was reviewed."
+    return 4
+  fi
+  case "$kind" in
+    review) render_json "$run/out"; show_repros "$run" ;;
+    recheck) render_json "$run/out" ;;
+    compare) show_compare "$run" ;;
+    *) cat "$run/out"; echo ;;
+  esac
+}
+
+# The newest review or recheck attempt, whatever its status.
+latest_newest_review() {
+  local d k
+  for d in $(ls -r "$TURN_DIR/runs" 2>/dev/null); do
+    k="$(cat "$TURN_DIR/runs/$d/kind" 2>/dev/null)"
+    case "$k" in review|recheck) printf '%s' "$TURN_DIR/runs/$d"; return 0 ;; esac
+  done
+  return 0
+}
+
+latest_run() { # latest_run [KIND] [STATUS]
+  local d k
+  for d in $(ls -r "$TURN_DIR/runs" 2>/dev/null); do
+    d="$TURN_DIR/runs/$d"
+    k="$(cat "$d/kind" 2>/dev/null)"
+    [ -n "${1:-}" ] && [ "$k" != "$1" ] && continue
+    [ -n "${2:-}" ] && [ "$(cat "$d/status" 2>/dev/null)" != "$2" ] && continue
+    printf '%s' "$d"; return 0
+  done
+  return 1
+}
+
+# --- executable repros ------------------------------------------------------------------
+# A blocker or major finding may carry a repro: a small test Codex wrote that
+# prints COUNTERPOINT-REPRO: FAIL (exit non-zero) while the bug is there and
+# COUNTERPOINT-REPRO: PASS (exit 0) once it is fixed. counterpoint runs them in a
+# throwaway copy of the project, never in it, under the minimal environment and a
+# short bound, all in parallel: before (on the reviewed code, right after the
+# review) and after (counterpoint verify, on the fixed code).
+repro_on() { [ "${COUNTERPOINT_REPRO:-1}" != 0 ] && [ -n "$(cp_json_tool)" ]; }
+
+# snapshot SRC DST: the files git would see (tracked and untracked, minus ignored
+# ones), with the usual dependency dirs linked in so a test can import them.
+# Prints the working directory inside DST that matches SRC.
+snapshot() {
+  local src="$1" dst="$2" top rel d kb
+  if top="$(cd "$src" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null)" && [ -n "$top" ]; then
+    ( cd "$top" && git ls-files -z -co --exclude-standard 2>/dev/null |
+        while IFS= read -r -d '' d; do [ -e "$d" ] && printf '%s\0' "$d"; done |
+        tar --null -T - -cf - 2>/dev/null ) | ( cd "$dst" && tar -xf - ) || return 1
+    for d in node_modules .venv venv vendor; do
+      [ -d "$top/$d" ] && [ ! -e "$dst/$d" ] && ln -s "$top/$d" "$dst/$d"
+    done
+    rel="$(cd "$src" && pwd)"; rel="${rel#"$top"}"
+    printf '%s' "$dst$rel"
+  else
+    kb="$(du -sk "$src" 2>/dev/null | awk '{print $1}')"
+    [ -n "$kb" ] && [ "$kb" -le 51200 ] || return 1
+    cp -R "$src/." "$dst/" 2>/dev/null || return 1
+    printf '%s' "$dst"
+  fi
+}
+
+# repro_one DIR CWD PHASE: run one finding's test, write DIR/PHASE (the outcome).
+repro_one() {
+  local d="$1" cwd="$2" phase="$3" file target rc=0 tmo n=0
+  file="$(head -1 "$d/file")"
+  # A fresh name per finding and attempt, never an existing path or symlink: the
+  # snapshot keeps the project's symlinks, and writing through one would reach
+  # the real project.
+  target="$cwd/$file"
+  while [ -e "$target" ] || [ -L "$target" ]; do
+    n=$((n + 1)); [ "$n" -gt 20 ] && { echo "inconclusive: could not place the test" > "$d/$phase"; return 0; }
+    target="$cwd/cp_$(basename "$d")_${$}_${RANDOM:-0}${n}_$file"
+  done
+  ( set -C; cat "$d/$file" > "$target" ) 2>/dev/null && [ ! -L "$target" ] || { echo "inconclusive: could not place the test" > "$d/$phase"; return 0; }
+  tmo="$(cp_num "${COUNTERPOINT_REPRO_TIMEOUT-30}" 30 COUNTERPOINT_REPRO_TIMEOUT)"
+  cp_codex_env_prepare
+  ( cd "$cwd" && cp_bound "$tmo" -- env -i ${CP_CODEX_ENV_ARGS+"${CP_CODEX_ENV_ARGS[@]}"} REPRO="$target" \
+      bash -c "$(cat "$d/command")" ) < /dev/null > "$d/$phase.log" 2>&1 || rc=$?
+  rm -f "$target"
+  if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then echo "inconclusive: hit the ${tmo}s bound" > "$d/$phase"
+  elif [ "$rc" = 1 ] && grep -qx 'COUNTERPOINT-REPRO: FAIL' "$d/$phase.log"; then echo fails > "$d/$phase"
+  elif [ "$rc" = 0 ] && grep -qx 'COUNTERPOINT-REPRO: PASS' "$d/$phase.log"; then echo passes > "$d/$phase"
+  else echo "inconclusive: exit $rc without the marker (broken test or missing tool)" > "$d/$phase"; fi
+}
+
+# run_repros RUN PHASE [CWD]: every repro of a review run, in parallel, in one
+# snapshot (taken now unless CWD is a snapshot already made).
+run_repros() {
+  local run="$1" phase="$2" cwd="${3:-}" snap="" id t0
+  [ -d "$run/repro" ] && [ -n "$(ls "$run/repro" 2>/dev/null)" ] || return 0
+  t0="$(date +%s)"
+  if [ -z "$cwd" ]; then
+    snap="$(cp_mktemp_d snap)"
+    cwd="$(snapshot "$(cat "$run/dir")" "$snap")" || cwd=""
+  fi
+  for id in $(ls "$run/repro"); do
+    if [ -z "$cwd" ]; then echo "inconclusive: could not copy the project" > "$run/repro/$id/$phase"
+    else repro_one "$run/repro/$id" "$cwd" "$phase" & fi
+  done
+  wait
+  [ -n "$snap" ] && rm -rf "$snap"
+  echo $(( $(date +%s) - t0 )) > "$run/repro_seconds.$phase"
+  return 0
+}
+
+show_repros() {
+  local run="$1" id b a
+  [ -d "$run/repro" ] && [ -n "$(ls "$run/repro" 2>/dev/null)" ] || return 0
+  echo
+  for id in $(ls "$run/repro"); do
+    b="$(cat "$run/repro/$id/before" 2>/dev/null || echo 'not run')"
+    a="$(cat "$run/repro/$id/after" 2>/dev/null || echo '')"
+    case "$b" in
+      fails) b="REPRODUCED (its test fails on the reviewed code)" ;;
+      passes) b="NOT reproduced (its test passes on the reviewed code: likely a false positive, or a wrong test)" ;;
+    esac
+    case "$a" in
+      '') ;; passes) a="; after the fix: test passes" ;; fails) a="; after the fix: STILL FAILS" ;; *) a="; after the fix: $a" ;;
+    esac
+    echo "repro $id: $b$a   [$run/repro/$id]"
+  done
+}
+
+# --- project memory -------------------------------------------------------------------
+# Each project (its git top level, or the directory) keeps the fate of every
+# finding in ~/.counterpoint/projects/<key>/history.jsonl, outside the repo. A
+# review is shown the project's recent rejections so Codex stops re-raising them.
+memory_on() { [ "${COUNTERPOINT_MEMORY:-1}" != 0 ] && [ -n "$(cp_json_tool)" ]; }
+project_root() {
+  local d="${1:-$OPT_DIR}" top
+  top="$(cd "$d" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null)" || top=""
+  [ -n "$top" ] && { printf '%s' "$top"; return 0; }
+  (cd "$d" 2>/dev/null && pwd)
+}
+project_dir() {
+  local root key
+  root="$(project_root "${1:-}")" || return 1
+  key="$(printf '%s' "$root" | cksum | awk '{print $1}')"
+  mkdir -p "$CP_HOME/projects/$key"
+  [ -f "$CP_HOME/projects/$key/path" ] || printf '%s\n' "$root" > "$CP_HOME/projects/$key/path"
+  printf '%s' "$CP_HOME/projects/$key"
+}
+
+memory_prompt() {
+  local hist="$1/history.jsonl" n rows
+  n="$(cp_num "${COUNTERPOINT_MEMORY_ITEMS-20}" 20 COUNTERPOINT_MEMORY_ITEMS)"
+  [ -f "$hist" ] && grep -q '"disposition":"rejected"' "$hist" || return 0
+  case "$(cp_json_tool)" in
+    python3)
+      rows="$(python3 -I - "$hist" "$n" <<'PY2' 2>/dev/null
+import json, sys
+rows = []
+for line in open(sys.argv[1]):
+    try:
+        r = json.loads(line)
+    except ValueError:
+        continue
+    if r.get("disposition") == "rejected":
+        rows.append(r)
+n = int(sys.argv[2])
+for r in (rows[-n:] if n else []):
+    print(f"- [{r.get('category','other')}] {str(r.get('where',''))[:120]}: {str(r.get('problem',''))[:200]} (rejected: {str(r.get('reason',''))[:200]})")
+PY2
+)" ;;
+    jq)
+      rows="$(jq -r 'select(.disposition == "rejected") | "- [\(.category)] \(.where[0:120]): \(.problem[0:200]) (rejected: \(.reason[0:200]))"' "$hist" 2>/dev/null | tail -n "$n")"
+      [ "$n" = 0 ] && rows="" ;;
+  esac
+  [ -n "$rows" ] || return 0
+  printf '\n## Already examined and rejected in this project\n\n'
+  printf 'The author verified these earlier findings and rejected them for the reason given. Do not raise them again unless you have new evidence (another input, a repro that fails); a re-raised finding says in its evidence what is new.\n\n'
+  printf '%s\n' "$rows"
+}
+
+# memory_record LEDGER: append one line per finding of this turn's completed reviews.
+memory_record() {
+  local ledger="$1" pdir d id sev cat where problem line verb reason now
+  memory_on || return 0
+  [ -f "$TURN_DIR/recorded" ] && return 0
+  pdir="$(cat "$TURN_DIR/project" 2>/dev/null)"; [ -n "$pdir" ] || return 0
+  now="$(date +%s)"
+  for d in "$TURN_DIR"/runs/*-review "$TURN_DIR"/runs/*-recheck; do
+    [ -f "$d/status" ] && [ "$(cat "$d/status")" = ok ] || continue
+    cp_findings_tsv "$d/out" | while IFS="$(printf '\t')" read -r id sev cat where problem; do
+      [ -n "$id" ] || continue
+      line="$(grep -E "^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]" "$ledger" | head -1)"
+      verb="$(printf '%s' "$line" | sed -E "s/^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]+//" | awk '{print tolower($1)}' | tr -d ':')"
+      [ "$verb" = fixed ] && verb=applied
+      reason="$(printf '%s' "$line" | sed -E "s/^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]+//" | sed -E 's/^[^[:space:]:]+:?[[:space:]]*//')"
+      [ "$verb" = applied ] && reason=""
+      printf '{"at":%s,"turn":"%s","id":"%s","severity":"%s","category":"%s","where":"%s","problem":"%s","disposition":"%s","reason":"%s","repro":"%s"}\n' \
+        "$now" "$TURN" "$id" "$(cp_json_escape "$sev")" "$(cp_json_escape "$cat")" "$(cp_json_escape "$where")" \
+        "$(cp_json_escape "$problem")" "$verb" "$(cp_json_escape "$reason")" \
+        "$(cat "$d/repro/$id/before" 2>/dev/null | cut -d: -f1)" >> "$pdir/history.jsonl"
+    done
+  done
+  : > "$TURN_DIR/recorded"
+}
+
+# Refuse to close on a reproduced bug whose fix was never shown to work.
+repro_gate() {
+  local ledger="$1" d id verb b a bad=0
+  for d in "$TURN_DIR"/runs/*-review; do
+    [ -d "$d/repro" ] || continue
+    for id in $(ls "$d/repro" 2>/dev/null); do
+      b="$(cat "$d/repro/$id/before" 2>/dev/null)"; a="$(cat "$d/repro/$id/after" 2>/dev/null)"
+      verb="$(grep -E "^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]" "$ledger" | head -1 | sed -E "s/^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]+//" | awk '{print tolower($1)}' | tr -d ':')"
+      case "$verb" in applied|fixed) ;; *) continue ;; esac
+      if [ "$b" = fails ]; then
+        case "$a" in
+          passes) ;;
+          fails) say "$id is marked applied but its repro still fails: the fix does not work"; bad=1 ;;
+          '') say "$id was reproduced by its test: run counterpoint verify to show the fix works"; bad=1 ;;
+          *) say "$id was reproduced by its test, but after the fix the test is $a: make it run (or mark $id deferred with a reason)"; bad=1 ;;
+        esac
+      elif [ "$b" = passes ]; then
+        say "WARNING $id is marked applied, but its own repro passed on the reviewed code: was it a real bug?"
+      fi
+    done
+  done
+  [ "$bad" = 0 ]
+}
+
+# --- plan comparison (full mode) ------------------------------------------------------
+# Both plans are judged blind, by Codex and by a fresh Claude session: they are
+# shown as A and B in a random order, with no file names. counterpoint unmasks the
+# labels, totals the scores itself and decides who produces: Codex when its plan
+# leads by COUNTERPOINT_CODEX_MARGIN points per judge (default 2 of 10), Claude
+# otherwise. One point is within a judge's noise, and the live session can run
+# the tests while it writes.
+
+# compare_totals OUT -> "A_total B_total" (each criterion counted once, missing = 0)
+compare_totals() {
+  case "$(cp_json_tool)" in
+    python3)
+      python3 -I - "$1" <<'PY' 2>/dev/null
+import json, sys
+d = json.load(open(sys.argv[1]))
+t = {"A": 0, "B": 0}
+for p in d.get("plans", []):
+    seen = {}
+    for s in p.get("scores", []):
+        c = s.get("criterion")
+        if c not in seen and isinstance(s.get("score"), int) and 0 <= s["score"] <= 2:
+            seen[c] = s["score"]
+    if p.get("label") in t:
+        t[p["label"]] = sum(seen.values())
+print(t["A"], t["B"])
+PY
+      ;;
+    jq)
+      jq -r '[(.plans // [])[] | {l: .label, t: ([(.scores // []) | unique_by(.criterion)[] | .score | select(type == "number" and . >= 0 and . <= 2)] | add // 0)}]
+             | "\((map(select(.l == "A")) | .[0].t) // 0) \((map(select(.l == "B")) | .[0].t) // 0)"' "$1" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+# A second judge: Claude in a fresh headless session, with no tools, no settings
+# and no memory of having written one of the plans, so it is as blind as Codex.
+# Two judges from two labs, summed, cancel each one's taste for its own style.
+claude_judge_on() { [ "${COUNTERPOINT_CLAUDE_JUDGE:-1}" != 0 ] && command -v claude >/dev/null 2>&1 && [ -n "$(cp_json_tool)" ]; }
+claude_judge() {
+  local run="$1" tmo
+  tmo="$(cp_num "${COUNTERPOINT_CODEX_TIMEOUT-600}" 600 timeout)"
+  cp_bound "$tmo" -- env -u CLAUDE_CODE_SESSION_ID -u COUNTERPOINT_TURN \
+    claude -p --no-session-persistence --strict-mcp-config --setting-sources "" --tools "" \
+      ${COUNTERPOINT_CLAUDE_JUDGE_MODEL:+--model "$COUNTERPOINT_CLAUDE_JUDGE_MODEL"} \
+      --output-format json --json-schema "$(cat "$SKILL_DIR/schemas/compare.json")" \
+      < "$run/prompt.md" > "$run/claude-judge.json" 2> "$run/claude-judge.stderr" || return 0
+  case "$(cp_json_tool)" in
+    python3) python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); o=d.get("structured_output"); assert isinstance(o, dict); json.dump(o, open(sys.argv[2], "w"))' \
+               "$run/claude-judge.json" "$run/out-claude" 2>/dev/null || rm -f "$run/out-claude" ;;
+    jq) jq -e '.structured_output | objects' "$run/claude-judge.json" > "$run/out-claude" 2>/dev/null || rm -f "$run/out-claude" ;;
+  esac
+  return 0
+}
+
+compare_decide() {
+  local run="$1" order t tA=0 tB=0 judges="" claude codex margin decision n=0 f
+  order="$(cat "$run/order")"
+  for f in out out-claude; do
+    [ -s "$run/$f" ] || continue
+    t="$(compare_totals "$run/$f")" || continue
+    [ -n "$t" ] || continue
+    tA=$((tA + ${t% *})); tB=$((tB + ${t#* })); n=$((n + 1))
+    case "$f" in out) judges="${judges}codex " ;; *) judges="${judges}claude " ;; esac
+  done
+  [ "$n" -gt 0 ] || { echo "unscored" > "$run/decision"; return 0; }
+  case "$order" in claude-first) claude="$tA"; codex="$tB" ;; *) claude="$tB"; codex="$tA" ;; esac
+  margin="$(cp_num "${COUNTERPOINT_CODEX_MARGIN-2}" 2 margin)"
+  if [ $((codex - claude)) -ge $((margin * n)) ]; then decision=codex; else decision=claude; fi
+  printf 'claude=%s\ncodex=%s\nmax=%s\njudges=%s\n' "$claude" "$codex" $((10 * n)) "${judges% }" > "$run/totals"
+  echo "$decision" > "$run/decision"
+}
+
+render_compare() { # render_compare FILE WHO_A WHO_B
+  if [ "$(cp_json_tool)" = python3 ]; then
+    python3 -I - "$@" <<'PY' 2>/dev/null && return 0
+import json, sys
+d = json.load(open(sys.argv[1])); who = {"A": sys.argv[2], "B": sys.argv[3]}
+for p in sorted(d.get("plans", []), key=lambda p: p.get("label", "")):
+    print(f"\n## Plan {p['label']} = {who.get(p['label'], '?')}")
+    for s in p.get("scores", []):
+        print(f"  {s['criterion']:<12} {s['score']}/2  {s['why']}")
+    for i in p.get("issues", []):
+        print(f"  - issue at {i['where']}: {i['problem']}\n    fix: {i['fix']}")
+    for k in p.get("keep", []):
+        print(f"  + keep: {k}")
+print(f"\nwhere they disagree: {d.get('summary', '')}")
+PY
+  fi
+  echo "Plan A = $2, Plan B = $3"; cat "$1"; echo
+}
+
+show_compare() {
+  local run="$1" who_a who_b
+  case "$(cat "$run/order")" in claude-first) who_a="Claude's plan"; who_b="Codex's plan" ;; *) who_a="Codex's plan"; who_b="Claude's plan" ;; esac
+  echo "### Codex's judgment (blind)"
+  render_compare "$run/out" "$who_a" "$who_b"
+  if [ -s "$run/out-claude" ]; then
+    echo; echo "### Claude's judgment (fresh headless session, blind)"
+    render_compare "$run/out-claude" "$who_a" "$who_b"
+  elif claude_judge_on; then
+    echo; echo "(the Claude judge did not answer: $(tail -1 "$run/claude-judge.stderr" 2>/dev/null); Codex's judgment decides alone)"
+  fi
+  echo
+  if [ "$(cat "$run/decision")" = unscored ]; then
+    echo "producer: Claude (no python3 or jq to total the scores)"
+    return 0
+  fi
+  echo "score ($(sed -n 's/^judges=//p' "$run/totals" | sed 's/ / + /') judges): Claude's plan $(sed -n 's/^claude=//p' "$run/totals")/$(sed -n 's/^max=//p' "$run/totals"), Codex's plan $(sed -n 's/^codex=//p' "$run/totals")/$(sed -n 's/^max=//p' "$run/totals")"
+  case "$(cat "$run/decision")" in
+    codex) echo "producer: CODEX (its plan leads by ${COUNTERPOINT_CODEX_MARGIN-2}+ points per judge). Merge the plans, then: counterpoint produce --plan merged.md; you review its output." ;;
+    *) echo "producer: Claude. Merge the plans (use the issues above), produce, then: counterpoint review --plan merged.md" ;;
+  esac
+}
+
+cmd_compare() {
+  local theirs="$OPT_THEIRS" plan_run first second
+  [ -n "$OPT_MINE" ] && [ -f "$OPT_MINE" ] || die "compare needs --mine FILE (your own plan, written before reading Codex's)"
+  if [ -z "$theirs" ]; then
+    plan_run="$(latest_run plan ok)" || die "no completed Codex plan in turn $TURN (counterpoint plan --bg ..., then wait)"
+    theirs="$plan_run/out"
+  fi
+  [ -f "$theirs" ] || die "no such plan: $theirs"
+  [ -n "$OPT_BRIEF$OPT_ASK" ] || die "compare needs the request: --brief FILE or --ask TEXT"
+  new_run compare
+  case "${COUNTERPOINT_COMPARE_ORDER:-}" in
+    claude-first|codex-first) echo "$COUNTERPOINT_COMPARE_ORDER" > "$RUN/order" ;;
+    *) if [ $((RANDOM % 2)) = 0 ]; then echo claude-first > "$RUN/order"; else echo codex-first > "$RUN/order"; fi ;;
+  esac
+  if [ "$(cat "$RUN/order")" = claude-first ]; then first="$OPT_MINE"; second="$theirs"; else first="$theirs"; second="$OPT_MINE"; fi
+  # Plans go in without their file names, which could say who wrote them.
+  { build_prompt compare
+    printf '\n## Plan A\n\n'; cat "$first"
+    printf '\n\n## Plan B\n\n'; cat "$second"; printf '\n'
+  } > "$RUN/prompt.md"
+  start_run compare
+}
+
+# --- commands -------------------------------------------------------------------------
+# start [small|full]: open a fresh turn for this task. The prompt hook does it on
+# its own when installed; without hooks this keeps two tasks of the same day or
+# session apart and sets the depth that done enforces. A turn the hook just
+# stamped and that has no run yet is reused rather than duplicated.
+cmd_start() {
+  local m="${POS[0]:-small}" sid t cur
+  case "$m" in small|full) ;; *) die "start takes small or full" ;; esac
+  sid="$(sid_of "${CLAUDE_CODE_SESSION_ID:-}")"
+  t="$(sid_of "${OPT_TURN:-}")"
+  if [ -z "$t" ] && [ -n "$sid" ] && [ -f "$CP_HOME/sessions/$sid/turn" ]; then
+    cur="$(head -1 "$CP_HOME/sessions/$sid/turn")"
+    [ -n "$cur" ] && [ ! -f "$CP_HOME/turns/$cur/done" ] && [ -z "$(ls "$CP_HOME/turns/$cur/runs" 2>/dev/null)" ] && t="$cur"
+  fi
+  [ -n "$t" ] || t="$(printf '%s' "${sid:-manual}" | cut -c 1-8)-$(date +%Y%m%d%H%M%S)-${RANDOM:-0}"
+  mkdir -p "$CP_HOME/turns/$t/runs" || die "cannot create the turn"
+  echo "$m" > "$CP_HOME/turns/$t/mode"
+  [ -f "$CP_HOME/turns/$t/started" ] || date +%s > "$CP_HOME/turns/$t/started"
+  if [ -n "$sid" ]; then
+    mkdir -p "$CP_HOME/sessions/$sid"
+    printf '%s\n' "$t" > "$CP_HOME/sessions/$sid/turn"
+    [ -f "$CP_HOME/sessions/$sid/armed" ] && printf '%s %s\n' "$t" "$m" > "$CP_HOME/sessions/$sid/armed"
+    echo "counterpoint: turn $t ($m)"
+  else
+    echo "counterpoint: turn $t ($m). Outside Claude Code, pass --turn $t to every command."
+  fi
+}
+
+
+cmd_review() {
+  [ ${#WORK[@]} -gt 0 ] || [ "$OPT_DIFF" = 1 ] || die "review needs --draft FILE and/or --diff"
+  [ -n "$OPT_BRIEF$OPT_ASK" ] || say "WARNING no --brief/--ask: Codex cannot check the work against the request"
+  [ "$OPT_DIFF" = 1 ] && check_diff_source
+  new_run review
+  build_prompt review > "$RUN/prompt.md"
+  assert_diff_ok
+  # Ids stay unique across the turn, so one ledger line never answers two findings.
+  local prior=0 d
+  for d in "$TURN_DIR"/runs/*-review "$TURN_DIR"/runs/*-recheck; do
+    [ -f "$d/status" ] && [ "$(cat "$d/status")" = ok ] && prior=$((prior + $(cp_finding_ids "$d/out" | wc -l)))
+  done
+  [ "$prior" -gt 0 ] && printf '\nEarlier reviews in this turn already used F1..F%s: number your findings from F%s.\n' "$prior" $((prior + 1)) >> "$RUN/prompt.md"
+  (cd "$OPT_DIR" && pwd) > "$RUN/dir"
+  if repro_on; then
+    : > "$RUN/repro.on"
+    cat "$SKILL_DIR/prompts/repro.md" >> "$RUN/prompt.md"
+  else
+    printf '\nSet "repro" to null on every finding.\n' >> "$RUN/prompt.md"
+  fi
+  if memory_on; then
+    local pdir; pdir="$(project_dir)" && { printf '%s\n' "$pdir" > "$TURN_DIR/project"; memory_prompt "$pdir" >> "$RUN/prompt.md"; }
+  fi
+  start_run review
+}
+
+cmd_plan() {
+  [ -n "$OPT_BRIEF$OPT_ASK" ] || die "plan needs --brief FILE or --ask TEXT"
+  new_run plan
+  build_prompt plan > "$RUN/prompt.md"
+  start_run plan
+}
+
+cmd_produce() {
+  [ -n "$OPT_BRIEF$OPT_ASK" ] || die "produce needs --brief FILE or --ask TEXT"
+  if [ -n "$OPT_WRITE" ]; then
+    [ -d "$OPT_WRITE" ] || die "--write needs an existing directory"
+    OPT_DIR="$(cd "$OPT_WRITE" && pwd)"
+    if ! cp_sandbox_usable && [ "$OPT_ALLOW_BYPASS" != 1 ] && [ "${COUNTERPOINT_ALLOW_BYPASS_WRITE:-0}" != 1 ]; then
+      die "Codex's sandbox cannot start on this host, so --write would run it unconfined. Re-run with --allow-bypass to accept that."
+    fi
+  fi
+  new_run produce
+  build_prompt produce > "$RUN/prompt.md"
+  start_run produce
+}
+
+cmd_recheck() {
+  local f
+  [ ${#WORK[@]} -gt 0 ] || [ "$OPT_DIFF" = 1 ] || die "recheck needs --draft FILE (the revised work) and/or --diff"
+  [ -n "$OPT_LEDGER" ] || die "recheck needs --ledger FILE"
+  [ "$OPT_DIFF" = 1 ] && check_diff_source
+  PREV="$(latest_run review ok)" || die "no completed review in turn $TURN to recheck"
+  [ -s "$PREV/thread" ] || die "the review run has no Codex thread id to resume"
+  new_run recheck
+  [ -f "$OPT_LEDGER" ] || die "no such ledger: $OPT_LEDGER"
+  { cat "$SKILL_DIR/prompts/recheck.md"
+    printf '\n## Ledger\n\n'; cat "$OPT_LEDGER"
+    if [ ${#WORK[@]} -gt 0 ]; then
+      printf '\n## Revised work\n'
+      for f in "${WORK[@]}"; do emit_file "$f"; done
+    fi
+    [ "$OPT_DIFF" = 1 ] && emit_diff
+    if [ -d "$PREV/repro" ] && [ -n "$(ls "$PREV/repro" 2>/dev/null)" ]; then
+      printf '\n## Your repros, run by counterpoint (before = reviewed code, after = revised code)\n\n'
+      for f in $(ls "$PREV/repro"); do
+        printf -- '- %s: before %s, after %s\n' "$f" "$(cat "$PREV/repro/$f/before" 2>/dev/null || echo 'not run')" "$(cat "$PREV/repro/$f/after" 2>/dev/null || echo 'not run')"
+      done
+    fi
+  } > "$RUN/prompt.md"
+  assert_diff_ok
+  local prior=0 d
+  for d in "$TURN_DIR"/runs/*-recheck; do
+    [ -f "$d/status" ] && [ "$(cat "$d/status")" = ok ] && prior=$((prior + $(cp_finding_ids "$d/out" | wc -l)))
+  done
+  [ "$prior" -gt 0 ] && printf '\nEarlier rechecks in this turn already used R1..R%s: number new findings from R%s.\n' "$prior" $((prior + 1)) >> "$RUN/prompt.md"
+  start_run recheck
+}
+
+cmd_verify() {
+  local run="${POS[0]:-}" id still=0
+  if [ -z "$run" ]; then run="$(latest_run review ok)" || die "no completed review in turn $TURN"; fi
+  case "$run" in /*) ;; *) run="$TURN_DIR/runs/$run" ;; esac
+  [ -d "$run/repro" ] && [ -n "$(ls "$run/repro" 2>/dev/null)" ] || { say "$(basename "$run") has no repro to run"; return 0; }
+  run_repros "$run" after
+  show_repros "$run"
+  for id in $(ls "$run/repro"); do [ "$(cat "$run/repro/$id/after" 2>/dev/null)" = fails ] && still=1; done
+  [ "$still" = 0 ] || return 5
+}
+
+cmd_wait() {
+  local run="${POS[0]:-}" waited=0 limit st
+  if [ -z "$run" ]; then
+    run="$(latest_run)" || die "no run in turn $TURN"
+  fi
+  case "$run" in /*) ;; *) run="$TURN_DIR/runs/$run" ;; esac
+  [ -d "$run" ] || die "no such run: $run"
+  limit=$(( $(cp_num "${COUNTERPOINT_CODEX_TIMEOUT-600}" 600 timeout) * 2 + 60 ))
+  while :; do
+    st="$(cat "$run/status")"
+    case "$st" in running|pending) ;; *) break ;; esac
+    [ "$waited" -ge "$limit" ] && die "gave up waiting on $run after ${waited}s"
+    sleep 2; waited=$((waited + 2))
+  done
+  show_run "$run"
+}
+
+# Ledger lines: "<id> applied[: note]" | "<id> rejected: <reason>" | "<id> deferred: <reason>"
+check_ledger() {
+  local ledger="$1" findings="$2" id line verb missing=0 bad=0
+  for id in $(cp_finding_ids "$findings"); do
+    line="$(grep -E "^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]" "$ledger" | head -1)"
+    if [ -z "$line" ]; then say "ledger has no line for $id"; missing=1; continue; fi
+    verb="$(printf '%s' "$line" | sed -E "s/^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]+//" | awk '{print tolower($1)}' | tr -d ':')"
+    case "$verb" in
+      applied|fixed) ;;
+      rejected|deferred)
+        printf '%s' "$line" | grep -qE "$verb:?[[:space:]]+[^[:space:]]" || { say "$id is $verb without a reason"; bad=1; } ;;
+      *) say "$id: say applied, rejected: <reason> or deferred: <reason> (got: $line)"; bad=1 ;;
+    esac
+  done
+  [ "$missing" = 0 ] && [ "$bad" = 0 ]
+}
+
+# Full mode is a dialogue: both plans, judged blind; the producer the judge chose
+# (or a stated reason to keep Claude); and, when Codex's review found anything,
+# Codex confirming the fixes after the newest review.
+full_gate() {
+  local review="$1" produce="$2" plan compare newest n
+  plan="$(latest_run plan ok || true)"
+  [ -n "$plan" ] || { say "full mode: no completed Codex plan in turn $TURN (counterpoint plan --bg ...)"; return 1; }
+  compare="$(latest_run compare ok || true)"
+  [ -n "$compare" ] || { say "full mode: the two plans were never compared (counterpoint compare --mine your-plan.md --brief ...)"; return 1; }
+  if [ "$(cat "$compare/decision" 2>/dev/null)" = codex ] && [ -z "$produce" ]; then
+    [ -n "$OPT_KEEP" ] || { say "full mode: the blind comparison gave production to Codex (counterpoint produce --plan merged.md), or pass --keep-producer \"why Claude wrote it anyway\""; return 1; }
+  fi
+  if [ -n "$review" ]; then
+    n="$(cp_finding_ids "$review/out" | wc -l | tr -d ' ')"
+    newest="$(latest_newest_review)"
+    if [ "$n" -gt 0 ] && [ "$(cat "$newest/kind")" != recheck ]; then
+      say "full mode: Codex has not confirmed the fixes (counterpoint recheck --diff|--draft FILE --ledger ledger.md)"; return 1
+    fi
+  fi
+  return 0
+}
+
+# The newest recheck's "unresolved" ids are fixes Codex says did not work. One
+# still marked applied means the turn would ship a fix that was disputed and never
+# re-checked: fix it again and recheck, or record why it stands (rejected/deferred).
+unresolved_gate() {
+  local ledger="$1" newest ids id line bad=0
+  newest="$(latest_newest_review)"
+  [ -n "$newest" ] && [ "$(cat "$newest/kind")" = recheck ] || return 0
+  case "$(cp_json_tool)" in
+    python3) ids="$(python3 -I -c 'import json,sys; [print(u.get("id","")) for u in json.load(open(sys.argv[1])).get("unresolved",[])]' "$newest/out" 2>/dev/null)" ;;
+    jq) ids="$(jq -r '(.unresolved // [])[].id' "$newest/out" 2>/dev/null)" ;;
+    *) return 0 ;;
+  esac
+  for id in $ids; do
+    line="$(grep -E "^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]" "$ledger" | head -1)"
+    if printf '%s' "$line" | grep -qiE "^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]+(applied|fixed)"; then
+      say "Codex's recheck says $id is still not fixed: fix it and run counterpoint recheck again, or mark it rejected: <why> / deferred: <why>"
+      bad=1
+    fi
+  done
+  [ "$bad" = 0 ]
+}
+
+count_verb() { grep -ciE "^[[:space:]]*[-*]?[[:space:]]*[A-Z][0-9]+[[:space:]:]+$2" "$1" 2>/dev/null || true; }
+
+cmd_done() {
+  local newest review recheck plan produce findings=0 applied=0 rejected=0 deferred=0 codex_s=0 d s verdict="none" status="reviewed"
+  if [ -n "$OPT_SKIP" ]; then
+    printf 'skipped=%s\n' "$OPT_SKIP" > "$TURN_DIR/done"
+    log_turn skipped 0 0 0 0 0 none
+    say "turn $TURN marked as having no deliverable: $OPT_SKIP"
+    return 0
+  fi
+  [ -n "$OPT_FINAL" ] && [ -f "$OPT_FINAL" ] || die "done needs --final FILE (the shipped result), or: counterpoint skip \"reason\""
+  review="$(latest_run review ok || true)"
+  recheck="$(latest_run recheck ok || true)"
+  plan="$(latest_run plan ok || true)"
+  produce="$(latest_run produce ok || true)"
+  newest="$(latest_newest_review)"
+  if [ -n "$newest" ] && [ "$(cat "$newest/status")" != ok ]; then
+    [ -n "$OPT_UNREVIEWED" ] || die "the newest $(cat "$newest/kind") ($(basename "$newest")) is $(cat "$newest/status"): wait for it or re-run it, or pass --unreviewed \"reason\""
+  fi
+  if [ -z "$review" ] && [ -z "$produce" ]; then
+    [ -n "$OPT_UNREVIEWED" ] || die "no completed Codex review in turn $TURN. Run counterpoint review, or pass --unreviewed \"reason\" to ship unreviewed on the record."
+  fi
+  [ -n "$OPT_UNREVIEWED" ] && status="unreviewed"
+  if [ "$TURN_MODE" = full ] && [ -z "$OPT_UNREVIEWED" ]; then
+    full_gate "$review" "$produce" || exit 2
+  fi
+  if [ -n "$review" ]; then
+    [ -n "$OPT_LEDGER" ] || die "done needs --ledger FILE: one line per finding (F1 applied | F2 rejected: why)"
+    [ "$OPT_LEDGER" = "-" ] && { cat > "$TURN_DIR/ledger.md"; OPT_LEDGER="$TURN_DIR/ledger.md"; }
+    [ -f "$OPT_LEDGER" ] || die "no such ledger: $OPT_LEDGER"
+    for d in "$TURN_DIR"/runs/*-review "$TURN_DIR"/runs/*-recheck; do
+      [ -f "$d/status" ] && [ "$(cat "$d/status")" = ok ] || continue
+      check_ledger "$OPT_LEDGER" "$d/out" || die "ledger incomplete: every finding of $(basename "$d") needs a disposition"
+    done
+    [ -n "$OPT_UNREVIEWED" ] || unresolved_gate "$OPT_LEDGER" || die "a fix Codex disputed is still marked applied"
+    [ -n "$OPT_UNREVIEWED" ] || repro_gate "$OPT_LEDGER" || die "a reproduced bug is marked applied without a passing repro (counterpoint verify), or pass --unreviewed \"reason\""
+    [ "$OPT_LEDGER" = "$TURN_DIR/ledger.md" ] || cp "$OPT_LEDGER" "$TURN_DIR/ledger.md"
+    findings=0
+    for d in "$TURN_DIR"/runs/*-review "$TURN_DIR"/runs/*-recheck; do
+      [ -f "$d/status" ] && [ "$(cat "$d/status")" = ok ] && findings=$((findings + $(cp_finding_ids "$d/out" | wc -l)))
+    done
+    applied="$(count_verb "$OPT_LEDGER" '(applied|fixed)')"
+    rejected="$(count_verb "$OPT_LEDGER" rejected)"
+    deferred="$(count_verb "$OPT_LEDGER" deferred)"
+    verdict="$(cp_json_string verdict < "${recheck:-$review}/out" || echo '?')"
+  fi
+  for d in "$TURN_DIR"/runs/*; do
+    s="$(cat "$d/seconds" 2>/dev/null || echo 0)"; codex_s=$((codex_s + s))
+  done
+  [ -n "$review" ] && memory_record "$TURN_DIR/ledger.md"
+  cp "$OPT_FINAL" "$TURN_DIR/result.md"
+  printf 'status=%s\nfinal=%s\nat=%s\n' "$status" "$OPT_FINAL" "$(date +%s)" > "$TURN_DIR/done"
+  [ -n "$OPT_KEEP" ] && printf 'kept_producer=%s\n' "$OPT_KEEP" >> "$TURN_DIR/done"
+  [ -n "$OPT_UNREVIEWED" ] && printf 'unreviewed=%s\n' "$OPT_UNREVIEWED" >> "$TURN_DIR/done"
+  log_turn "$status" "$findings" "$applied" "$rejected" "$deferred" "$codex_s" "$verdict"
+  echo "counterpoint ($TURN_MODE): $findings finding(s), $applied applied, $rejected rejected, $deferred deferred | final verdict: $verdict | codex ${codex_s}s | turn $TURN"
+}
+
+log_turn() {
+  local started now
+  started="$(stat_started)"; now="$(date +%s)"
+  printf '{"turn":"%s","mode":"%s","status":"%s","findings":%s,"applied":%s,"rejected":%s,"deferred":%s,"codex_seconds":%s,"wall_seconds":%s,"verdict":"%s","at":%s}\n' \
+    "$TURN" "$TURN_MODE" "$1" "$2" "$3" "$4" "$5" "$6" $((now - started)) "$7" "$now" >> "$CP_HOME/log.jsonl"
+}
+stat_started() { local s; s="$(cat "$TURN_DIR/started" 2>/dev/null)"; case "$s" in ''|*[!0-9]*) date +%s ;; *) echo "$s" ;; esac; }
+
+cmd_status() {
+  local d
+  echo "turn $TURN (mode: $TURN_MODE)  $TURN_DIR"
+  for d in "$TURN_DIR"/runs/*; do
+    [ -d "$d" ] || continue
+    printf '  %-14s %-10s %6ss  effort=%s\n' "$(basename "$d")" "$(cat "$d/status")" "$(cat "$d/seconds" 2>/dev/null || echo '-')" "$(cat "$d/effort" 2>/dev/null)"
+  done
+  if [ -f "$TURN_DIR/done" ]; then echo "  done: $(head -1 "$TURN_DIR/done")"; else echo "  not done yet"; fi
+}
+
+cmd_log() {
+  local n="${POS[0]:-20}" f="$CP_HOME/log.jsonl"
+  [ -f "$f" ] || { echo "no finished turns yet"; return 0; }
+  tail -n "$n" "$f" | awk '
+    function num(k,   m) { if (match($0, "\"" k "\":[0-9]+")) { m = substr($0, RSTART, RLENGTH); sub(/.*:/, "", m); return m + 0 } return 0 }
+    function str(k,   m) { if (match($0, "\"" k "\":\"[^\"]*\"")) { m = substr($0, RSTART, RLENGTH); sub(/^[^:]*:"/, "", m); sub(/"$/, "", m); return m } return "" }
+    BEGIN { printf "%-34s %-7s %-10s %4s %4s %4s %6s %6s\n", "turn", "mode", "status", "find", "appl", "rej", "codex", "wall" }
+    { printf "%-34s %-7s %-10s %4d %4d %4d %5ds %5ds\n", substr(str("turn"),1,34), str("mode"), str("status"), num("findings"), num("applied"), num("rejected"), num("codex_seconds"), num("wall_seconds")
+      t++; F += num("findings"); A += num("applied"); R += num("rejected"); C += num("codex_seconds") }
+    END { if (t) printf "\n%d turns: %d findings, %d applied (%d%%), %d rejected; mean Codex time %ds per turn\n", t, F, A, (F ? 100 * A / F : 0), R, C / t }'
+}
+
+# Per category: how often a finding was applied, rejected or deferred, and how
+# the repros fared. The fields read here are fixed enums, so awk is enough.
+cmd_stats() {
+  local files="" pdir
+  if [ "$OPT_ALL" = 1 ]; then
+    files="$(ls "$CP_HOME"/projects/*/history.jsonl 2>/dev/null)"
+  else
+    pdir="$(project_dir)" || die "cannot resolve the project for $OPT_DIR"
+    [ -f "$pdir/history.jsonl" ] && files="$pdir/history.jsonl"
+    echo "project: $(cat "$pdir/path")"
+  fi
+  [ -n "$files" ] || { echo "no recorded findings yet (they are recorded by counterpoint done)"; return 0; }
+  # shellcheck disable=SC2086
+  cat $files | awk '
+    function str(k,   m) { if (match($0, "\"" k "\":\"[a-z]*\"")) { m = substr($0, RSTART, RLENGTH); sub(/^[^:]*:"/, "", m); sub(/"$/, "", m); return m } return "" }
+    { c = str("category"); if (c == "") c = "other"; d = str("disposition"); r = str("repro")
+      n[c]++; N++; if (d == "applied") { a[c]++; A++ } else if (d == "rejected") { j[c]++; J++ } else { f[c]++; F++ }
+      if (r == "fails") { rf++; if (d == "applied") rfa++ } else if (r == "passes") { rp++; if (d == "rejected") rpj++ } }
+    END {
+      printf "%-12s %5s %7s %8s %8s %8s\n", "category", "total", "applied", "rejected", "deferred", "precision"
+      for (c in n) printf "%-12s %5d %7d %8d %8d %7d%%\n", c, n[c], a[c], j[c], f[c], 100 * a[c] / n[c]
+      printf "%-12s %5d %7d %8d %8d %7d%%\n", "all", N, A, J, F, (N ? 100 * A / N : 0)
+      if (rf + rp) printf "\nrepros: %d reproduced (%d applied), %d not reproduced (%d rejected)\n", rf, rfa, rp, rpj
+    }'
+}
+
+cmd_forget() {
+  local pdir; pdir="$(project_dir)" || die "cannot resolve the project for $OPT_DIR"
+  rm -f "$pdir/history.jsonl"
+  echo "forgot the finding history of $(cat "$pdir/path")"
+}
+
+cmd_mode() {
+  local m="${POS[0]:-}"
+  mkdir -p "$CP_HOME"
+  case "$m" in
+    "") cat "$CP_HOME/mode" 2>/dev/null || echo off ;;
+    off|small|full) echo "$m" > "$CP_HOME/mode"; echo "counterpoint mode: $m" ;;
+    *) die "mode is off, small or full" ;;
+  esac
+}
+
+cmd_doctor() {
+  local tbin settings="$HOME/.claude/settings.json"
+  echo "counterpoint $VERSION  ($SKILL_DIR)"
+  echo "bash:     $BASH_VERSION"
+  if command -v codex >/dev/null 2>&1; then
+    echo "codex:    $(codex --version 2>/dev/null | tail -1)"
+    echo "login:    $(codex login status 2>&1 | grep -v WARNING | tail -1)"
+  else
+    echo "codex:    MISSING (npm i -g @openai/codex, then codex login)"
+  fi
+  echo "model:    ${COUNTERPOINT_MODEL:-Codex default}  effort: ${COUNTERPOINT_EFFORT:-per phase (review medium/high, plan/compare medium, recheck low)}  fast: ${COUNTERPOINT_FAST:-0}"
+  tbin="$(cp_timeout_bin)"; echo "timeout:  ${tbin:-shell watchdog} (${COUNTERPOINT_CODEX_TIMEOUT:-600}s per call)"
+  if cp_sandbox_usable; then echo "sandbox:  Codex sandbox usable"; else echo "sandbox:  unavailable here (review/plan still work: everything is inlined; produce --write needs --allow-bypass)"; fi
+  echo "repros:   $(repro_on && echo "on (${COUNTERPOINT_REPRO_TIMEOUT:-30}s each, via $(cp_json_tool))" || echo 'off (COUNTERPOINT_REPRO=0, or no python3/jq)')"
+  echo "memory:   $(memory_on && echo "on (last ${COUNTERPOINT_MEMORY_ITEMS:-20} rejections per project)" || echo 'off (COUNTERPOINT_MEMORY=0, or no python3/jq)')"
+  if [ "${COUNTERPOINT_CLAUDE_JUDGE:-1}" = 0 ]; then echo "judges:   Codex only (COUNTERPOINT_CLAUDE_JUDGE=0)"
+  elif command -v claude >/dev/null 2>&1; then echo "judges:   Codex + a blind claude -p session (full mode)"
+  else echo "judges:   Codex only (no claude CLI on PATH)"; fi
+  echo "renderer: $(command -v python3 >/dev/null 2>&1 && echo python3 || { command -v jq >/dev/null 2>&1 && echo jq || echo 'raw JSON'; })"
+  echo "mode:     $(cat "$CP_HOME/mode" 2>/dev/null || echo off)"
+  if [ -f "$settings" ] && grep -q 'counterpoint/hooks/prompt.sh' "$settings" && grep -q 'counterpoint/hooks/stop.sh' "$settings"; then
+    echo "hooks:    both wired in $settings"
+  else
+    echo "hooks:    not wired (needed only for the always-on toggle; see README)"
+  fi
+  if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then echo "session:  CLAUDE_CODE_SESSION_ID set, runs are attributed to this session's turn"
+  else echo "session:  CLAUDE_CODE_SESSION_ID unset (outside Claude Code): pass --turn ID, or runs go to the shared manual-<date> turn"; fi
+  echo "turns:    $(ls "$CP_HOME/turns" 2>/dev/null | wc -l | tr -d ' ') recorded in $CP_HOME/turns"
+}
+
+cmd_gc() {
+  local days; days="$(cp_num "${POS[0]:-${COUNTERPOINT_RETENTION_DAYS:-30}}" 30 days)"
+  [ -d "$CP_HOME/turns" ] || return 0
+  find "$CP_HOME/turns" -mindepth 1 -maxdepth 1 -type d -mtime +"$days" -exec rm -rf {} + 2>/dev/null
+  echo "removed turns older than $days days"
+}
+
+cmd_help() {
+  cat <<EOF
+counterpoint $VERSION: Claude and Codex on one task. Claude decides.
+
+  start    [small|full]                              open a turn for this task (first command of a task)
+  review   --draft FILE... | --diff [--base REF]   Codex reviews the work (structured findings)
+           [--brief FILE | --ask TEXT] [--context FILE]... [--plan FILE] [--focus TEXT] [--bg]
+  plan     --brief FILE | --ask TEXT [--context FILE]... [--bg]   Codex plans independently
+  compare  --mine FILE [--theirs FILE] --brief FILE [--context FILE]... [--bg]
+           Codex and a fresh Claude judge both plans blind; names the producer (full mode)
+  produce  --brief FILE | --ask TEXT [--plan FILE] [--write DIR [--allow-bypass]]   Codex writes it
+  wait     [RUN]                                     collect a --bg run and print it
+  verify   [RUN]                                     re-run the review's repros on the fixed code
+  recheck  --draft FILE | --diff  --ledger FILE      Codex confirms the fixes (same thread, fast)
+  done     --final FILE --ledger FILE|-              record the shipped result and every finding's fate
+           [--keep-producer "why"] (full mode: Claude wrote although the comparison chose Codex)
+  skip     "reason"                                  this turn has no deliverable
+  status | log [N] | stats [--all] | forget | mode [off|small|full] | doctor | gc [DAYS]
+
+Common: --turn ID, -C DIR (repo for --diff, default .), --effort low|medium|high|xhigh,
+        --no-repro (no executable repros), --no-memory (no project rejection history)
+Ledger lines: "F1 applied", "F2 rejected: <why>", "F3 deferred: <why>"
+Env: COUNTERPOINT_CODEX_MARGIN (2), COUNTERPOINT_CLAUDE_JUDGE=0, COUNTERPOINT_CLAUDE_JUDGE_MODEL, COUNTERPOINT_MODEL, COUNTERPOINT_EFFORT, COUNTERPOINT_FAST=1, COUNTERPOINT_CODEX_TIMEOUT (600),
+     COUNTERPOINT_REPRO=0, COUNTERPOINT_REPRO_TIMEOUT (30), COUNTERPOINT_MEMORY=0, COUNTERPOINT_MEMORY_ITEMS (20)
+EOF
+}
+
+# --- dispatch -------------------------------------------------------------------------
+cmd="${1:-help}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+  _job) run_job "$1"; exit $? ;;
+  help|-h|--help) cmd_help; exit 0 ;;
+  version|--version) echo "$VERSION"; exit 0 ;;
+esac
+parse_opts "$@"
+case "$cmd" in
+  mode) cmd_mode; exit $? ;;
+  doctor) cmd_doctor; exit $? ;;
+  log) cmd_log; exit $? ;;
+  gc) cmd_gc; exit $? ;;
+  stats) cmd_stats; exit $? ;;
+  forget) cmd_forget; exit $? ;;
+  start) cmd_start; exit $? ;;
+esac
+resolve_turn
+[ -f "$TURN_DIR/started" ] || date +%s > "$TURN_DIR/started"
+case "$cmd" in
+  review) cmd_review ;;
+  plan) cmd_plan ;;
+  compare) cmd_compare ;;
+  produce) cmd_produce ;;
+  recheck) cmd_recheck ;;
+  wait) cmd_wait ;;
+  verify) cmd_verify ;;
+  done) cmd_done ;;
+  skip) OPT_SKIP="${POS[*]:-no deliverable}"; cmd_done ;;
+  status) cmd_status ;;
+  *) die "unknown command '$cmd' (see: counterpoint help)" ;;
+esac

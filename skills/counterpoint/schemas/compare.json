@@ -1,0 +1,99 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "summary",
+    "plans"
+  ],
+  "properties": {
+    "summary": {
+      "type": "string"
+    },
+    "plans": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "label",
+          "scores",
+          "issues",
+          "keep"
+        ],
+        "properties": {
+          "label": {
+            "type": "string",
+            "enum": [
+              "A",
+              "B"
+            ]
+          },
+          "scores": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "criterion",
+                "score",
+                "why"
+              ],
+              "properties": {
+                "criterion": {
+                  "type": "string",
+                  "enum": [
+                    "constraints",
+                    "correctness",
+                    "specificity",
+                    "risks",
+                    "insight"
+                  ]
+                },
+                "score": {
+                  "type": "integer",
+                  "enum": [
+                    0,
+                    1,
+                    2
+                  ]
+                },
+                "why": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "issues": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "where",
+                "problem",
+                "fix"
+              ],
+              "properties": {
+                "where": {
+                  "type": "string"
+                },
+                "problem": {
+                  "type": "string"
+                },
+                "fix": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "keep": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  }
+}
