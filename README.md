@@ -111,6 +111,15 @@ About 6 minutes in our end-to-end run, most of it the review.
 
 In both modes, the turn cannot close until every finding has a decision, and a bug proven by a test cannot be marked fixed while its test still fails. If Codex is down, the work can still ship, and the record says it went unreviewed.
 
+### On a real codebase
+
+Four rules from the first weeks of use on payment, permissions and SQL work:
+
+- **Review each change before committing it.** A narrow review stays on the change and returns in 1 to 3 minutes.
+- **Codex sees exactly what you list.** `--draft a.sql b.sql c.sql` sends all three, and every call prints what Codex receives (files, sizes, the diff) and warns when a file is cut or left out.
+- **Old code does not hold a change back.** Codex tags each finding with its origin. A defect in code the change did not touch is marked `PRE-EXISTING`: it needs no decision in this turn, and `done` files it as a separate task (`--backlog TODO.md`). Once nothing of the change is blocker or major, the review says `stop` and the turn closes. A turn takes at most 3 reviews, since a reviewer always finds something more in old code.
+- **Tell Codex what it cannot see.** `counterpoint facts add "migration 042 is applied in production"` records a fact for the project, outside the repo, and every later call gets it. When a bug depends on a real database, Codex writes the query that shows it (`Needs a live check:`) instead of a test that fakes the database. When a test cannot check a fix, `F3 applied, verified: <how you checked it>` accepts that one finding on your stated check and keeps the rest of the turn reviewed.
+
 ## Speed
 
 Measured with the real Codex on 2026-11-03, small runs on the same task with and without bug tests.
@@ -154,25 +163,26 @@ Claude runs these for you. They also work on their own (optionally link `bin/cou
 | Command | What it does |
 |---|---|
 | `start small` or `start full` | open a turn for a new task, at that depth |
-| `review --diff` or `--draft FILE` | Codex reviews the work. `--brief`/`--ask` give it the request, `--context` the constraints, `--plan` the agreed plan, `--bg` runs it in the background |
+| `review --diff` or `--draft FILE...` | Codex reviews the work. `--brief`/`--ask` give it the request, `--context FILE...` the constraints, `--plan` the agreed plan, `--bg` runs it in the background, `--again` a review past the third of a turn |
 | `plan --brief FILE` | Codex plans independently (full mode) |
 | `compare --mine FILE --brief FILE` | two blind judges (Codex and a fresh Claude session) score both plans and name who writes (full mode) |
 | `produce --brief FILE [--write DIR]` | Codex writes the deliverable (full mode, when its plan is better) |
 | `wait` | collect a background run and print it |
 | `verify` | re-run the bug tests on the fixed code |
 | `recheck --diff --ledger FILE` | Codex confirms the fixes in its own thread (full mode) |
-| `done --final FILE --ledger FILE` | close the turn (full mode: `--keep-producer "why"` if Claude wrote although Codex's plan won) |
+| `done --final FILE --ledger FILE` | close the turn. `--backlog FILE` appends the pre-existing findings there as tasks (full mode: `--keep-producer "why"` if Claude wrote although Codex's plan won) |
 | `skip "reason"` | close a turn with nothing to review (a question, a discussion) |
 | `status` | the current turn's Codex runs |
 | `log` | your last turns: findings raised, applied, rejected, Codex time |
 | `stats [--all]` | how often each category of finding held up in this project |
 | `forget` | clear this project's finding history |
+| `facts`, `facts add TEXT`, `facts clear` | what Codex cannot see from the code (applied migrations, what is deployed), sent with every call for this project |
 | `doctor` | check the setup |
 | `gc [DAYS]` | delete turn records older than 30 days |
 
 Each task starts with `counterpoint start small|full`, which Claude runs for you. Inside Claude Code, every later command belongs to that turn of its own session, so tasks and parallel sessions never mix. Outside it, pass `--turn ID`.
 
-`done` refuses to close when a finding has no decision, a rejection has no reason, a reproduced bug is marked fixed but its test fails or was never re-run, the latest review failed or is still running, a fix Codex's recheck disputes is still marked applied, or, in full mode, the plans were never compared, the chosen author did not write, or the fixes were never rechecked. `--unreviewed "<why>"` ships anyway and says so in the record.
+`done` refuses to close when a finding of the change has no decision, a rejection has no reason, a reproduced bug is marked fixed but its test fails or was never re-run, the latest review failed or is still running, a fix Codex's recheck disputes is still marked applied, or, in full mode, the plans were never compared, the chosen author did not write, or the fixes were never rechecked. `--unreviewed "<why>"` ships anyway and says so in the record.
 
 </details>
 
@@ -192,6 +202,9 @@ Each task starts with `counterpoint start small|full`, which Claude runs for you
 | `COUNTERPOINT_CODEX_ENV_PASSTHROUGH` | | extra variable names Codex and the bug tests may see |
 | `COUNTERPOINT_REPRO` | `1` | `0` turns bug tests off (same as `--no-repro`) |
 | `COUNTERPOINT_REPRO_TIMEOUT` | `30` | seconds per bug test |
+| `COUNTERPOINT_REPRO_ENV_PASSTHROUGH` | | variable names the bug tests may see, Codex never (a test database URL) |
+| `COUNTERPOINT_MAX_REVIEWS` | `3` | reviews per turn before `--again` is needed; `0` lifts the cap |
+| `COUNTERPOINT_FACTS` | `1` | `0` stops sending the project facts |
 | `COUNTERPOINT_MEMORY` | `1` | `0` stops showing Codex past rejections (same as `--no-memory`) |
 | `COUNTERPOINT_MEMORY_ITEMS` | `20` | how many past rejections a review is shown |
 | `COUNTERPOINT_HOME` | `~/.counterpoint` | where turns, the log and the project history live |
@@ -206,7 +219,8 @@ Each task starts with `counterpoint start small|full`, which Claude runs for you
 - Review, plan and recheck are read-only. Only `produce --write DIR` lets Codex edit files, and where Codex's own sandbox cannot start (some containers) it refuses unless you pass `--allow-bypass`.
 - Bug tests are code written by Codex, so they always run in a throwaway copy of your project (the files git tracks, with `node_modules`, `.venv`, `venv` and `vendor` linked in), with the same empty environment and a 30 s limit. They have no sandbox beyond that: use `--no-repro` where running reviewer-written tests is not acceptable.
 - The blind Claude judge in full mode runs as `claude -p` with no tools, no MCP servers, no settings or hooks, and no session saved. It only reads the two plans and the request.
-- The project history stays on your machine, in `~/.counterpoint/projects/`, outside the repo.
+- The project history and facts stay on your machine, in `~/.counterpoint/projects/`, outside the repo. Facts are sent to Codex with every call, so keep secrets out of them.
+- A bug test sees a variable only if you name it in `COUNTERPOINT_REPRO_ENV_PASSTHROUGH`; Codex itself never sees those.
 - Codex sees what you hand it: the request, the context files and the work. Keep secrets out of them.
 
 </details>
@@ -221,7 +235,7 @@ Linux or macOS, including a stock Mac (bash 3.2, BSD tools, no `timeout`). Full 
 <details>
 <summary><b>How it is tested</b></summary>
 
-- About 200 offline checks run against a fake `codex` and a fake `claude`, so they cost nothing: every command, the decision rules, the bug tests (reproduced, not reproduced, broken, slow, secrets kept out, real project untouched), the memory, the plan comparison and its gates, the hooks, timeouts and retries. `tests/run-all.sh` runs them under your bash and again under bash 3.2 as shipped on macOS.
+- About 280 offline checks run against a fake `codex` and a fake `claude`, so they cost nothing: every command, the decision rules, the bug tests (reproduced, not reproduced, broken, slow, secrets kept out, real project untouched), the memory, the plan comparison and its gates, the hooks, timeouts and retries. `tests/run-all.sh` runs them under your bash and again under bash 3.2 as shipped on macOS.
 - A portability check rejects GNU-only flags and bash 4 syntax.
 - Live runs with the real Codex and Claude Code, in small and full mode, on tasks with an automatic checker. The speed numbers above come from them. counterpoint also reviewed its own code before this release: Codex found and proved 3 real bugs, which were fixed.
 

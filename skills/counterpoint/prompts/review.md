@@ -11,5 +11,6 @@ Rules that keep your review useful:
 - severity: "blocker" = wrong or unsafe to ship; "major" = should be fixed before shipping; "minor" = worth fixing, safe to ship without.
 - Taste, style preferences and alternative designs that are not better on the stated constraints are not findings.
 - ids are F1, F2, ... in order of severity.
-- verdict "ship" when there is no blocker and no major, otherwise "fix". An empty findings list is a valid, good answer.
+- origin: "change" when the defect is in what this work adds or modifies (with a diff: the changed lines, and what they directly break); "preexisting" when it sits in code the work did not touch and the work does not make it worse. Stay on the change: report a pre-existing defect only if it is a blocker or major, at most 5 of them, each in one finding. They are recorded as separate tasks and never hold this change back.
+- verdict "ship" when no blocker or major of origin "change" remains, otherwise "fix". An empty findings list is a valid, good answer.
 - Reason from the material provided. Open repository files only when a finding depends on code that is not included. Do not run builds, tests or network calls.

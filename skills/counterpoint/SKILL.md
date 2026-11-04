@@ -14,10 +14,12 @@ One CLI does the Codex side: `<skill_dir>/bin/counterpoint` (call it `cp` below;
 ## The three rules that make it work
 
 1. **Codex findings are hypotheses.** A reviewer that cannot run your tests is wrong often enough to make code worse if obeyed blindly. Before applying a finding, check it: run the failing input, read the cited line, re-read the constraint. Apply what holds and reject what does not, with a reason.
-2. **Parity.** Hand Codex what you were given: the request (`--brief` or `--ask`, verbatim) and every document that constrains it (`--context AGENTS.md`, the skill, the spec). A constraint the reviewer never read is one it cannot check.
+2. **Parity.** Hand Codex what you were given: the request (`--brief` or `--ask`, verbatim) and every document that constrains it (`--context AGENTS.md spec.md`). Every file goes after one flag (`--draft a.sql b.sql`); read the `Codex receives:` line before trusting a review. State Codex cannot see from the code (migrations applied in production, what is deployed) goes in the project facts once: `cp facts add "migration 042 is applied in production"`; every later call gets them.
 3. **Never block on Codex.** Launch with `--bg`, keep working (tests, your own checks), then `cp wait`.
 
 ## Small mode: produce, review, decide, ship
+
+Review each piece of work before committing it, one coherent change at a time: a narrow review stays on the change and comes back fast.
 
 1. Produce the work as usual (edit files, write the document).
 2. Review it, in the background:
@@ -30,8 +32,12 @@ One CLI does the Codex side: `<skill_dir>/bin/counterpoint` (call it `cp` below;
    F1 applied
    F2 rejected: the cited input is rejected earlier by parse_args (line 40)
    F3 deferred: out of scope for this change, noted in the PR
+   F4 applied, verified: ran the charge twice on the staging database, one row
    ```
+   `verified: <how>` is for a reproduced bug whose repro cannot check the fix (it needs the real database): it accepts that one finding on your stated check, which is recorded. Findings tagged `PRE-EXISTING` sit in code this change did not touch: they need no line, and `cp done` files them as separate tasks (`--backlog TODO.md` appends them there).
 5. `cp done --final <shipped file> --ledger ledger.md` (for code, the final file can be a short summary of the change). Small mode is one review: no second round.
+
+**When to stop.** When the review prints `stop: nothing blocks this change`, close the turn. A reviewer always finds something more in old code; that is backlog, not this change. A turn takes at most 3 reviews (`--again` for one more).
 
 `cp done` also records every finding's fate for the project (outside the repo); the next review is shown the project's recent rejections so Codex stops re-raising them. `cp stats` shows how often each category of finding held up; `cp forget` clears it. `--no-repro` and `--no-memory` switch either off.
 

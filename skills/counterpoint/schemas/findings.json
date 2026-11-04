@@ -26,6 +26,7 @@
           "id",
           "severity",
           "category",
+          "origin",
           "where",
           "problem",
           "evidence",
@@ -53,6 +54,13 @@
               "constraint",
               "clarity",
               "other"
+            ]
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "change",
+              "preexisting"
             ]
           },
           "where": {

@@ -17,7 +17,7 @@ SKILL_DIR="$(cd "$(dirname "$src")/.." && pwd)"
 
 CP_HOME="${COUNTERPOINT_HOME:-$HOME/.counterpoint}"
 case "$CP_HOME" in /*) ;; *) CP_HOME="$PWD/$CP_HOME" ;; esac
-VERSION="3.0.0"
+VERSION="3.1.0"
 
 die() { echo "counterpoint: $*" >&2; exit 2; }
 say() { echo "counterpoint: $*" >&2; }
@@ -46,7 +46,7 @@ resolve_turn() {
 OPT_TURN=""; OPT_BRIEF=""; OPT_ASK=""; OPT_PLAN=""; OPT_BG=0; OPT_EFFORT=""
 OPT_DIFF=0; OPT_BASE=""; OPT_DIR="$PWD"; OPT_FINAL=""; OPT_LEDGER=""; OPT_WRITE=""
 OPT_ALLOW_BYPASS=0; OPT_UNREVIEWED=""; OPT_SKIP=""; OPT_FOCUS=""; OPT_ALL=0
-OPT_MINE=""; OPT_THEIRS=""; OPT_KEEP=""
+OPT_MINE=""; OPT_THEIRS=""; OPT_KEEP=""; OPT_AGAIN=0; OPT_BACKLOG=""
 CONTEXT=(); WORK=(); POS=()
 parse_opts() {
   while [ $# -gt 0 ]; do
@@ -54,8 +54,16 @@ parse_opts() {
       --turn) OPT_TURN="$2"; shift 2 ;;
       --brief) OPT_BRIEF="$2"; shift 2 ;;
       --ask) OPT_ASK="$2"; shift 2 ;;
-      --context|-c) CONTEXT+=("$2"); shift 2 ;;
-      --draft|--work|-w) WORK+=("$2"); shift 2 ;;
+      --context|-c|--draft|--work|-w)
+        # Each takes one or more files: everything up to the next option. Taking
+        # only the first silently dropped the rest of a list (seen in the field).
+        local flag="$1"; shift
+        [ $# -gt 0 ] && case "$1" in -*) false ;; esac || die "$flag needs a file"
+        while [ $# -gt 0 ]; do
+          case "$1" in -*) break ;; esac
+          case "$flag" in --context|-c) CONTEXT+=("$1") ;; *) WORK+=("$1") ;; esac
+          shift
+        done ;;
       --plan) OPT_PLAN="$2"; shift 2 ;;
       --mine) OPT_MINE="$2"; shift 2 ;;
       --theirs) OPT_THEIRS="$2"; shift 2 ;;
@@ -74,6 +82,8 @@ parse_opts() {
       --no-repro) export COUNTERPOINT_REPRO=0; shift ;;
       --no-memory) export COUNTERPOINT_MEMORY=0; shift ;;
       --unreviewed) OPT_UNREVIEWED="$2"; shift 2 ;;
+      --again) OPT_AGAIN=1; shift ;;
+      --backlog) OPT_BACKLOG="$2"; shift 2 ;;
       -h|--help) cmd_help; exit 0 ;;
       --*) die "unknown option $1 (see: counterpoint help)" ;;
       *) POS+=("$1"); shift ;;
@@ -82,10 +92,16 @@ parse_opts() {
 }
 
 # --- prompt assembly --------------------------------------------------------------
+# Every file that goes into a prompt is listed in RUN/manifest (section, bytes,
+# path), so the author sees exactly what Codex received before trusting a review.
+CP_SECTION=file
+manifest_add() { [ -n "${RUN:-}" ] && [ -d "$RUN" ] && printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$RUN/manifest"; return 0; }
 emit_file() {
   local f="$1" max=400000 size
   [ -f "$f" ] || die "no such file: $f"
   size="$(wc -c < "$f" | tr -d ' ')"
+  manifest_add "$CP_SECTION" "$size" "$f"
+  [ "$size" -gt "$max" ] && manifest_add truncated "$max" "$f"
   printf '\n### %s\n\n' "$f"
   if [ "$size" -gt "$max" ]; then
     head -c "$max" "$f"
@@ -122,10 +138,35 @@ emit_diff() {
     elif git rev-parse --verify --quiet HEAD >/dev/null; then git diff HEAD || : > "$RUN/diff.failed"
     else { git diff --cached && git diff; } || : > "$RUN/diff.failed"; fi
     printf '```\n'
-    local f
+    local f n_untracked lines
+    lines="$(if [ -n "$OPT_BASE" ]; then git diff "$OPT_BASE"; elif git rev-parse --verify --quiet HEAD >/dev/null; then git diff HEAD; else git diff --cached; git diff; fi 2>/dev/null | wc -l | tr -d ' ')"
+    manifest_add diff "$lines" "${OPT_BASE:-uncommitted changes vs HEAD}"
+    n_untracked="$(git ls-files --others --exclude-standard 2>/dev/null | wc -l | tr -d ' ')"
+    [ "$n_untracked" -gt 50 ] && manifest_add dropped $((n_untracked - 50)) "untracked files beyond the first 50"
+    CP_SECTION=untracked
     git ls-files --others --exclude-standard 2>/dev/null | head -50 | while IFS= read -r f; do
       [ -f "$f" ] && emit_file "$f"
     done )
+}
+
+# show_manifest RUN: one line saying what Codex receives, plus a warning for
+# anything cut or left out.
+show_manifest() {
+  local m="$1/manifest"
+  [ -f "$m" ] || { say "Codex receives: the request only"; return 0; }
+  awk -F '\t' '
+    function kb(b) { return (b < 1024) ? b " B" : int((b + 512) / 1024) " KB" }
+    $1 == "truncated" { trunc = trunc sprintf("\ncounterpoint: WARNING %s was cut to its first %s", $3, kb($2)); next }
+    $1 == "dropped" { drop = drop sprintf("\ncounterpoint: WARNING %s %s were not sent", $2, $3); next }
+    $1 == "diff" { diff = sprintf("diff (%s lines, %s)", $2, $3); next }
+    { n[$1]++; total += $2; if (length(list[$1]) < 300) list[$1] = list[$1] (list[$1] == "" ? "" : ", ") $3 " " kb($2) }
+    END {
+      line = ""
+      split("work context facts plan untracked brief file", order, " ")
+      for (i = 1; i <= 7; i++) { s = order[i]; if (n[s]) line = line (line == "" ? "" : "; ") n[s] " " s " file" (n[s] > 1 ? "s" : "") " (" list[s] ")" }
+      if (diff != "") line = line (line == "" ? "" : "; ") diff
+      printf "counterpoint: Codex receives: %s%s%s\n", (line == "" ? "the request only" : line), trunc, drop
+    }' "$m" >&2
 }
 
 # build_prompt KIND > file
@@ -137,20 +178,21 @@ build_prompt() {
   [ -n "$OPT_FOCUS" ] && printf '\nFocus for this pass: %s\n' "$OPT_FOCUS"
   printf '\n## Request\n\n'
   if [ -n "$OPT_BRIEF" ]; then
-    if [ "$OPT_BRIEF" = "-" ]; then cat; else [ -f "$OPT_BRIEF" ] || die "no such brief: $OPT_BRIEF"; cat "$OPT_BRIEF"; fi
+    if [ "$OPT_BRIEF" = "-" ]; then cat; else [ -f "$OPT_BRIEF" ] || die "no such brief: $OPT_BRIEF"; manifest_add brief "$(wc -c < "$OPT_BRIEF" | tr -d ' ')" "$OPT_BRIEF"; cat "$OPT_BRIEF"; fi
   fi
   [ -n "$OPT_ASK" ] && printf '%s\n' "$OPT_ASK"
   if [ ${#CONTEXT[@]} -gt 0 ]; then
     printf '\n## Context documents (the constraints the work must satisfy)\n'
-    for f in "${CONTEXT[@]}"; do emit_file "$f"; done
+    CP_SECTION=context; for f in "${CONTEXT[@]}"; do emit_file "$f"; done
   fi
+  emit_facts
   if [ -n "$OPT_PLAN" ]; then
     printf '\n## Agreed plan\n'
-    emit_file "$OPT_PLAN"
+    CP_SECTION=plan; emit_file "$OPT_PLAN"
   fi
   if [ ${#WORK[@]} -gt 0 ]; then
     if [ "$kind" = "recheck" ]; then printf '\n## Revised work\n'; else printf '\n## Work under review\n'; fi
-    for f in "${WORK[@]}"; do emit_file "$f"; done
+    CP_SECTION=work; for f in "${WORK[@]}"; do emit_file "$f"; done
   fi
   [ "$OPT_DIFF" = 1 ] && emit_diff
   return 0
@@ -248,6 +290,7 @@ run_job() {
 
 start_run() {
   local kind="$1"
+  show_manifest "$RUN"
   write_cmd "$kind"
   cp_codex_env_prepare
   if [ "$OPT_BG" = 1 ]; then
@@ -273,13 +316,13 @@ print(f"verdict: {d.get('verdict','?')}  |  {d.get('summary','')}")
 for u in d.get("unresolved", []):
     print(f"\n- UNRESOLVED {u['id']}: {u['why']}")
 for x in d.get("findings", []):
-    print(f"\n- {x['id']} [{x['severity']}{'/' + x['category'] if x.get('category') else ''}] {x['where']}\n  problem: {x['problem']}\n  evidence: {x['evidence']}\n  fix: {x['fix']}")
+    print(f"\n- {x['id']} [{x['severity']}{'/' + x['category'] if x.get('category') else ''}{', PRE-EXISTING' if x.get('origin') == 'preexisting' else ''}] {x['where']}\n  problem: {x['problem']}\n  evidence: {x['evidence']}\n  fix: {x['fix']}")
 if not d.get("findings") and not d.get("unresolved"):
     print("\n(no findings)")
 PY
   fi
   if command -v jq >/dev/null 2>&1; then
-    jq -r '"verdict: \(.verdict)  |  \(.summary)", ((.unresolved // [])[] | "- UNRESOLVED \(.id): \(.why)"), (.findings[] | "- \(.id) [\(.severity)\(if .category then "/" + .category else "" end)] \(.where)\n  problem: \(.problem)\n  evidence: \(.evidence)\n  fix: \(.fix)")' "$f" 2>/dev/null && return 0
+    jq -r '"verdict: \(.verdict)  |  \(.summary)", ((.unresolved // [])[] | "- UNRESOLVED \(.id): \(.why)"), (.findings[] | "- \(.id) [\(.severity)\(if .category then "/" + .category else "" end)\(if .origin == "preexisting" then ", PRE-EXISTING" else "" end)] \(.where)\n  problem: \(.problem)\n  evidence: \(.evidence)\n  fix: \(.fix)")' "$f" 2>/dev/null && return 0
   fi
   cat "$f"; echo
 }
@@ -295,11 +338,35 @@ show_run() {
     return 4
   fi
   case "$kind" in
-    review) render_json "$run/out"; show_repros "$run" ;;
+    review) render_json "$run/out"; show_repros "$run"; stop_hint "$run" ;;
     recheck) render_json "$run/out" ;;
     compare) show_compare "$run" ;;
     *) cat "$run/out"; echo ;;
   esac
+}
+
+# The stopping rule, said out loud: once nothing of the change is blocker or
+# major, another review only digs further into old code.
+stop_hint() {
+  local run="$1" cv pre
+  cv="$(cp_change_verdict "$run/out")"
+  pre="$(cp_preexisting_tsv "$run/out" | wc -l | tr -d ' ')"
+  echo
+  [ "$pre" -gt 0 ] && echo "pre-existing: $pre finding(s) outside this change. No ledger line needed: counterpoint done files them as separate tasks (deferred)."
+  if [ "$cv" = ship ]; then
+    echo "stop: nothing blocks this change. Dispose of the findings and close the turn with counterpoint done; do not review again."
+  fi
+}
+
+# How many reviews this turn already has: completed ones and ones still running
+# (a --bg review counts from its launch); a failed call does not, so it can be retried.
+review_count() {
+  local d n=0
+  for d in "$TURN_DIR"/runs/*-review; do
+    [ -f "$d/status" ] || continue
+    case "$(cat "$d/status")" in ok|running|pending) n=$((n + 1)) ;; esac
+  done
+  echo "$n"
 }
 
 # The newest review or recheck attempt, whatever its status.
@@ -370,6 +437,12 @@ repro_one() {
   ( set -C; cat "$d/$file" > "$target" ) 2>/dev/null && [ ! -L "$target" ] || { echo "inconclusive: could not place the test" > "$d/$phase"; return 0; }
   tmo="$(cp_num "${COUNTERPOINT_REPRO_TIMEOUT-30}" 30 COUNTERPOINT_REPRO_TIMEOUT)"
   cp_codex_env_prepare
+  # Opt-in names a project's tests need (a test database URL): repros only.
+  local name
+  for name in $(printf '%s' "${COUNTERPOINT_REPRO_ENV_PASSTHROUGH:-}" | tr ',' ' '); do
+    case "$name" in [0-9]*|*[!A-Za-z0-9_]*) continue ;; esac
+    [ "${!name+x}" = "x" ] && CP_CODEX_ENV_ARGS+=("$name=${!name}")
+  done
   ( cd "$cwd" && cp_bound "$tmo" -- env -i ${CP_CODEX_ENV_ARGS+"${CP_CODEX_ENV_ARGS[@]}"} REPRO="$target" \
       bash -c "$(cat "$d/command")" ) < /dev/null > "$d/$phase.log" 2>&1 || rc=$?
   rm -f "$target"
@@ -468,22 +541,61 @@ PY2
   printf '%s\n' "$rows"
 }
 
+# --- project facts ---------------------------------------------------------------------
+# State the reviewer cannot see from the code (which migrations are applied in
+# production, what is deployed where, what a test environment lacks), recorded by
+# the author once per project, outside the repo, and put into every prompt.
+facts_on() { [ "${COUNTERPOINT_FACTS:-1}" != 0 ]; }
+facts_file() { local pdir; pdir="$(project_dir)" || return 1; printf '%s/facts.md' "$pdir"; }
+emit_facts() {
+  local f
+  facts_on || return 0
+  f="$(facts_file 2>/dev/null)" || return 0
+  [ -s "$f" ] || return 0
+  printf '\n## Project facts (recorded by the author; take them as true: they describe state you cannot see from the code)\n\n'
+  cat "$f"
+  manifest_add facts "$(wc -c < "$f" | tr -d ' ')" "project facts"
+}
+cmd_facts() {
+  local f sub="${POS[0]:-show}" text
+  f="$(facts_file)" || die "cannot resolve the project for $OPT_DIR"
+  case "$sub" in
+    show)
+      echo "project: $(cat "$(dirname "$f")/path")"
+      if [ -s "$f" ]; then cat "$f"; else echo "(no facts yet: counterpoint facts add \"migration 042 is applied in production\")"; fi ;;
+    add)
+      text="${POS[*]:1}"
+      [ -n "$text" ] || die "facts add needs the text of the fact"
+      printf -- '- %s (%s)\n' "$text" "$(date +%Y-%m-%d)" >> "$f"
+      echo "recorded for $(cat "$(dirname "$f")/path"): $text" ;;
+    clear) rm -f "$f"; echo "cleared the facts of $(cat "$(dirname "$f")/path")" ;;
+    path) echo "$f" ;;
+    *) die "facts takes show, add TEXT, clear or path" ;;
+  esac
+}
+
 # memory_record LEDGER: append one line per finding of this turn's completed reviews.
 memory_record() {
-  local ledger="$1" pdir d id sev cat where problem line verb reason now
+  local ledger="$1" pdir d id sev cat where problem line verb reason now pre
   memory_on || return 0
   [ -f "$TURN_DIR/recorded" ] && return 0
   pdir="$(cat "$TURN_DIR/project" 2>/dev/null)"; [ -n "$pdir" ] || return 0
   now="$(date +%s)"
   for d in "$TURN_DIR"/runs/*-review "$TURN_DIR"/runs/*-recheck; do
     [ -f "$d/status" ] && [ "$(cat "$d/status")" = ok ] || continue
+    pre=" $(cp_preexisting_tsv "$d/out" | cut -f1 | tr '\n' ' ') "
     cp_findings_tsv "$d/out" | while IFS="$(printf '\t')" read -r id sev cat where problem; do
       [ -n "$id" ] || continue
       line="$(grep -E "^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]" "$ledger" | head -1)"
-      verb="$(printf '%s' "$line" | sed -E "s/^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]+//" | awk '{print tolower($1)}' | tr -d ':')"
+      if [ -z "$line" ]; then
+        case "$pre" in *" $id "*) line="$id deferred: pre-existing, outside this change" ;; esac
+      fi
+      verb="$(printf '%s' "$line" | sed -E "s/^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]+//" | awk '{print tolower($1)}' | tr -d ':,;')"
       [ "$verb" = fixed ] && verb=applied
       reason="$(printf '%s' "$line" | sed -E "s/^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]+//" | sed -E 's/^[^[:space:]:]+:?[[:space:]]*//')"
-      [ "$verb" = applied ] && reason=""
+      if [ "$verb" = applied ]; then
+        reason="$(printf '%s' "$line" | grep -oiE 'verified:.*' | head -1)"
+      fi
       printf '{"at":%s,"turn":"%s","id":"%s","severity":"%s","category":"%s","where":"%s","problem":"%s","disposition":"%s","reason":"%s","repro":"%s"}\n' \
         "$now" "$TURN" "$id" "$(cp_json_escape "$sev")" "$(cp_json_escape "$cat")" "$(cp_json_escape "$where")" \
         "$(cp_json_escape "$problem")" "$verb" "$(cp_json_escape "$reason")" \
@@ -493,21 +605,33 @@ memory_record() {
   : > "$TURN_DIR/recorded"
 }
 
-# Refuse to close on a reproduced bug whose fix was never shown to work.
+# Refuse to close on a reproduced bug whose fix was never shown to work. A test
+# that cannot exercise the fix (it needs a real database, a service) does not
+# sink the whole turn: "F3 applied, verified: <how you checked it>" accepts that
+# one finding on the author's stated check, which is recorded.
 repro_gate() {
-  local ledger="$1" d id verb b a bad=0
+  local ledger="$1" d id line verb b a how bad=0
+  rm -f "$TURN_DIR/verified-by-hand"
   for d in "$TURN_DIR"/runs/*-review; do
     [ -d "$d/repro" ] || continue
     for id in $(ls "$d/repro" 2>/dev/null); do
       b="$(cat "$d/repro/$id/before" 2>/dev/null)"; a="$(cat "$d/repro/$id/after" 2>/dev/null)"
-      verb="$(grep -E "^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]" "$ledger" | head -1 | sed -E "s/^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]+//" | awk '{print tolower($1)}' | tr -d ':')"
+      line="$(grep -E "^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]" "$ledger" | head -1)"
+      verb="$(printf '%s' "$line" | sed -E "s/^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]+//" | awk '{print tolower($1)}' | tr -d ':,;')"
       case "$verb" in applied|fixed) ;; *) continue ;; esac
+      how="$(printf '%s' "$line" | grep -oiE 'verified:[[:space:]]*[^[:space:]].*' | head -1 | sed -E 's/^[Vv][Ee][Rr][Ii][Ff][Ii][Ee][Dd]:[[:space:]]*//')"
+      if [ "$b" = fails ] && [ "$a" != passes ] && [ -n "$how" ]; then
+        if [ "$a" = fails ]; then say "WARNING $id: its repro still fails after the fix; accepted on your check ($how). Be sure the test is what is wrong."
+        else say "$id: its repro could not check the fix (${a:-never re-run}); accepted on your check: $how"; fi
+        echo "$id" >> "$TURN_DIR/verified-by-hand"
+        continue
+      fi
       if [ "$b" = fails ]; then
         case "$a" in
           passes) ;;
-          fails) say "$id is marked applied but its repro still fails: the fix does not work"; bad=1 ;;
+          fails) say "$id is marked applied but its repro still fails: the fix does not work (if the test is what is wrong, say how you checked: $id applied, verified: <how>)"; bad=1 ;;
           '') say "$id was reproduced by its test: run counterpoint verify to show the fix works"; bad=1 ;;
-          *) say "$id was reproduced by its test, but after the fix the test is $a: make it run (or mark $id deferred with a reason)"; bad=1 ;;
+          *) say "$id was reproduced by its test, but after the fix the test is $a: make it run, or record how you checked the fix: $id applied, verified: <how>"; bad=1 ;;
         esac
       elif [ "$b" = passes ]; then
         say "WARNING $id is marked applied, but its own repro passed on the reviewed code: was it a real bug?"
@@ -687,6 +811,12 @@ cmd_review() {
   [ ${#WORK[@]} -gt 0 ] || [ "$OPT_DIFF" = 1 ] || die "review needs --draft FILE and/or --diff"
   [ -n "$OPT_BRIEF$OPT_ASK" ] || say "WARNING no --brief/--ask: Codex cannot check the work against the request"
   [ "$OPT_DIFF" = 1 ] && check_diff_source
+  local max done_n
+  max="$(cp_num "${COUNTERPOINT_MAX_REVIEWS-3}" 3 COUNTERPOINT_MAX_REVIEWS)"
+  done_n="$(review_count)"
+  if [ "$max" -gt 0 ] && [ "$done_n" -ge "$max" ] && [ "$OPT_AGAIN" != 1 ]; then
+    die "turn $TURN already has $done_n reviews. A review that keeps finding something is usually digging into old code: close with counterpoint done (pre-existing findings become separate tasks), use counterpoint recheck to confirm fixes, or pass --again to review anyway."
+  fi
   new_run review
   build_prompt review > "$RUN/prompt.md"
   assert_diff_ok
@@ -743,7 +873,7 @@ cmd_recheck() {
     printf '\n## Ledger\n\n'; cat "$OPT_LEDGER"
     if [ ${#WORK[@]} -gt 0 ]; then
       printf '\n## Revised work\n'
-      for f in "${WORK[@]}"; do emit_file "$f"; done
+      CP_SECTION=work; for f in "${WORK[@]}"; do emit_file "$f"; done
     fi
     [ "$OPT_DIFF" = 1 ] && emit_diff
     if [ -d "$PREV/repro" ] && [ -n "$(ls "$PREV/repro" 2>/dev/null)" ]; then
@@ -791,12 +921,17 @@ cmd_wait() {
 }
 
 # Ledger lines: "<id> applied[: note]" | "<id> rejected: <reason>" | "<id> deferred: <reason>"
+# A pre-existing finding with no line is deferred on its own (it goes to the backlog).
 check_ledger() {
-  local ledger="$1" findings="$2" id line verb missing=0 bad=0
+  local ledger="$1" findings="$2" id line verb missing=0 bad=0 pre
+  pre=" $(cp_preexisting_tsv "$findings" | cut -f1 | tr '\n' ' ') "
   for id in $(cp_finding_ids "$findings"); do
     line="$(grep -E "^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]" "$ledger" | head -1)"
-    if [ -z "$line" ]; then say "ledger has no line for $id"; missing=1; continue; fi
-    verb="$(printf '%s' "$line" | sed -E "s/^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]+//" | awk '{print tolower($1)}' | tr -d ':')"
+    if [ -z "$line" ]; then
+      case "$pre" in *" $id "*) continue ;; esac
+      say "ledger has no line for $id"; missing=1; continue
+    fi
+    verb="$(printf '%s' "$line" | sed -E "s/^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]+//" | awk '{print tolower($1)}' | tr -d ':,;')"
     case "$verb" in
       applied|fixed) ;;
       rejected|deferred)
@@ -895,7 +1030,13 @@ cmd_done() {
     applied="$(count_verb "$OPT_LEDGER" '(applied|fixed)')"
     rejected="$(count_verb "$OPT_LEDGER" rejected)"
     deferred="$(count_verb "$OPT_LEDGER" deferred)"
-    verdict="$(cp_json_string verdict < "${recheck:-$review}/out" || echo '?')"
+    backlog_write "$OPT_LEDGER"
+    deferred=$((deferred + $(cat "$TURN_DIR/backlog.auto" 2>/dev/null || echo 0)))
+    if [ -n "$recheck" ] && [ "$(cat "$newest/kind")" = recheck ]; then
+      verdict="$(cp_json_string verdict < "$recheck/out" || echo '?')"
+    else
+      verdict="$(cp_change_verdict "$review/out")"
+    fi
   fi
   for d in "$TURN_DIR"/runs/*; do
     s="$(cat "$d/seconds" 2>/dev/null || echo 0)"; codex_s=$((codex_s + s))
@@ -906,7 +1047,38 @@ cmd_done() {
   [ -n "$OPT_KEEP" ] && printf 'kept_producer=%s\n' "$OPT_KEEP" >> "$TURN_DIR/done"
   [ -n "$OPT_UNREVIEWED" ] && printf 'unreviewed=%s\n' "$OPT_UNREVIEWED" >> "$TURN_DIR/done"
   log_turn "$status" "$findings" "$applied" "$rejected" "$deferred" "$codex_s" "$verdict"
-  echo "counterpoint ($TURN_MODE): $findings finding(s), $applied applied, $rejected rejected, $deferred deferred | final verdict: $verdict | codex ${codex_s}s | turn $TURN"
+  local extra=""
+  [ -s "$TURN_DIR/verified-by-hand" ] && extra=" ($(sort -u "$TURN_DIR/verified-by-hand" | wc -l | tr -d ' ') verified by hand)"
+  echo "counterpoint ($TURN_MODE): $findings finding(s), $applied applied$extra, $rejected rejected, $deferred deferred | final verdict: $verdict | codex ${codex_s}s | turn $TURN"
+  if [ -s "$TURN_DIR/backlog.md" ]; then
+    echo "pre-existing defects, filed as separate tasks: ${OPT_BACKLOG:-$TURN_DIR/backlog.md}"
+  fi
+}
+
+# backlog_write LEDGER: the pre-existing findings left without a ledger line (or
+# deferred) become a task list, in the turn and, with --backlog FILE, appended there.
+backlog_write() {
+  local ledger="$1" d id sev cat where problem fix line n=0
+  : > "$TURN_DIR/backlog.md"
+  for d in "$TURN_DIR"/runs/*-review; do
+    [ -f "$d/status" ] && [ "$(cat "$d/status")" = ok ] || continue
+    while IFS="$(printf '\t')" read -r id sev cat where problem fix; do
+      [ -n "$id" ] || continue
+      line="$(grep -E "^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]" "$ledger" | head -1)"
+      if [ -z "$line" ]; then n=$((n + 1))
+      else printf '%s' "$line" | grep -qiE "^[[:space:]]*[-*]?[[:space:]]*$id[[:space:]:]+deferred" || continue
+      fi
+      printf -- '- [ ] %s [%s/%s] %s: %s (suggested fix: %s) (counterpoint turn %s)\n' "$id" "$sev" "$cat" "$where" "$problem" "$fix" "$TURN" >> "$TURN_DIR/backlog.md"
+    done <<EOF
+$(cp_preexisting_tsv "$d/out")
+EOF
+  done
+  echo "$n" > "$TURN_DIR/backlog.auto"
+  if [ -s "$TURN_DIR/backlog.md" ] && [ -n "$OPT_BACKLOG" ] && [ ! -f "$TURN_DIR/backlog.appended" ]; then
+    if cat "$TURN_DIR/backlog.md" >> "$OPT_BACKLOG"; then : > "$TURN_DIR/backlog.appended"
+    else say "WARNING could not append to $OPT_BACKLOG"; fi
+  fi
+  return 0
 }
 
 log_turn() {
@@ -995,6 +1167,8 @@ cmd_doctor() {
   tbin="$(cp_timeout_bin)"; echo "timeout:  ${tbin:-shell watchdog} (${COUNTERPOINT_CODEX_TIMEOUT:-600}s per call)"
   if cp_sandbox_usable; then echo "sandbox:  Codex sandbox usable"; else echo "sandbox:  unavailable here (review/plan still work: everything is inlined; produce --write needs --allow-bypass)"; fi
   echo "repros:   $(repro_on && echo "on (${COUNTERPOINT_REPRO_TIMEOUT:-30}s each, via $(cp_json_tool))" || echo 'off (COUNTERPOINT_REPRO=0, or no python3/jq)')"
+  echo "facts:    $(facts_on && { f="$(facts_file 2>/dev/null)"; [ -s "$f" ] && echo "$(wc -l < "$f" | tr -d ' ') for this project" || echo 'none for this project (counterpoint facts add ...)'; } || echo 'off (COUNTERPOINT_FACTS=0)')"
+  echo "reviews:  at most ${COUNTERPOINT_MAX_REVIEWS:-3} per turn (--again for one more)"
   echo "memory:   $(memory_on && echo "on (last ${COUNTERPOINT_MEMORY_ITEMS:-20} rejections per project)" || echo 'off (COUNTERPOINT_MEMORY=0, or no python3/jq)')"
   if [ "${COUNTERPOINT_CLAUDE_JUDGE:-1}" = 0 ]; then echo "judges:   Codex only (COUNTERPOINT_CLAUDE_JUDGE=0)"
   elif command -v claude >/dev/null 2>&1; then echo "judges:   Codex + a blind claude -p session (full mode)"
@@ -1024,24 +1198,28 @@ counterpoint $VERSION: Claude and Codex on one task. Claude decides.
 
   start    [small|full]                              open a turn for this task (first command of a task)
   review   --draft FILE... | --diff [--base REF]   Codex reviews the work (structured findings)
-           [--brief FILE | --ask TEXT] [--context FILE]... [--plan FILE] [--focus TEXT] [--bg]
-  plan     --brief FILE | --ask TEXT [--context FILE]... [--bg]   Codex plans independently
-  compare  --mine FILE [--theirs FILE] --brief FILE [--context FILE]... [--bg]
+           [--brief FILE | --ask TEXT] [--context FILE...] [--plan FILE] [--focus TEXT] [--bg] [--again]
+  plan     --brief FILE | --ask TEXT [--context FILE...] [--bg]   Codex plans independently
+  compare  --mine FILE [--theirs FILE] --brief FILE [--context FILE...] [--bg]
            Codex and a fresh Claude judge both plans blind; names the producer (full mode)
   produce  --brief FILE | --ask TEXT [--plan FILE] [--write DIR [--allow-bypass]]   Codex writes it
   wait     [RUN]                                     collect a --bg run and print it
   verify   [RUN]                                     re-run the review's repros on the fixed code
   recheck  --draft FILE | --diff  --ledger FILE      Codex confirms the fixes (same thread, fast)
-  done     --final FILE --ledger FILE|-              record the shipped result and every finding's fate
+  done     --final FILE --ledger FILE|- [--backlog FILE]   record the result and every finding's fate
            [--keep-producer "why"] (full mode: Claude wrote although the comparison chose Codex)
   skip     "reason"                                  this turn has no deliverable
+  facts    [show | add TEXT | clear | path]          state Codex cannot see (applied migrations...), sent with every call
   status | log [N] | stats [--all] | forget | mode [off|small|full] | doctor | gc [DAYS]
 
 Common: --turn ID, -C DIR (repo for --diff, default .), --effort low|medium|high|xhigh,
         --no-repro (no executable repros), --no-memory (no project rejection history)
-Ledger lines: "F1 applied", "F2 rejected: <why>", "F3 deferred: <why>"
+Ledger lines: "F1 applied", "F2 rejected: <why>", "F3 deferred: <why>",
+              "F4 applied, verified: <how>" (a repro that cannot check the fix, e.g. it needs the real database)
+Pre-existing findings need no line: done files them as separate tasks.
 Env: COUNTERPOINT_CODEX_MARGIN (2), COUNTERPOINT_CLAUDE_JUDGE=0, COUNTERPOINT_CLAUDE_JUDGE_MODEL, COUNTERPOINT_MODEL, COUNTERPOINT_EFFORT, COUNTERPOINT_FAST=1, COUNTERPOINT_CODEX_TIMEOUT (600),
-     COUNTERPOINT_REPRO=0, COUNTERPOINT_REPRO_TIMEOUT (30), COUNTERPOINT_MEMORY=0, COUNTERPOINT_MEMORY_ITEMS (20)
+     COUNTERPOINT_REPRO=0, COUNTERPOINT_REPRO_TIMEOUT (30), COUNTERPOINT_REPRO_ENV_PASSTHROUGH (names, comma-separated),
+     COUNTERPOINT_MEMORY=0, COUNTERPOINT_MEMORY_ITEMS (20), COUNTERPOINT_FACTS=0, COUNTERPOINT_MAX_REVIEWS (3, 0 = no cap)
 EOF
 }
 
@@ -1060,7 +1238,12 @@ case "$cmd" in
   gc) cmd_gc; exit $? ;;
   stats) cmd_stats; exit $? ;;
   forget) cmd_forget; exit $? ;;
+  facts) cmd_facts; exit $? ;;
   start) cmd_start; exit $? ;;
+esac
+case "$cmd" in
+  review|plan|compare|produce|recheck|done)
+    [ ${#POS[@]} -eq 0 ] || die "$cmd: unexpected argument '${POS[0]}' (a file list goes right after --draft or --context)" ;;
 esac
 resolve_turn
 [ -f "$TURN_DIR/started" ] || date +%s > "$TURN_DIR/started"

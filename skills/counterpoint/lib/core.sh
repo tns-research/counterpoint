@@ -290,3 +290,35 @@ PY
       done ;;
   esac
 }
+
+# Findings outside the change under review, one per line:
+# id<TAB>severity<TAB>category<TAB>where<TAB>problem<TAB>fix. A finding with no
+# origin (an older reply) counts as part of the change.
+cp_preexisting_tsv() {
+  case "$(cp_json_tool)" in
+    python3)
+      python3 -I - "$1" <<'PY' 2>/dev/null
+import json, sys
+d = json.load(open(sys.argv[1]))
+c = lambda s: " ".join(str(s or "").split())
+for f in d.get("findings", []):
+    if f.get("origin") == "preexisting":
+        print("\t".join([c(f.get("id")), c(f.get("severity")), c(f.get("category") or "other"), c(f.get("where")), c(f.get("problem")), c(f.get("fix"))]))
+PY
+      ;;
+    jq)
+      jq -r '.findings[] | select(.origin == "preexisting") | [.id, .severity, (.category // "other"), .where, .problem, .fix] | map(tostring | gsub("[[:space:]]+"; " ")) | @tsv' "$1" 2>/dev/null ;;
+  esac
+}
+
+# The verdict for the change alone: "fix" while a blocker or major of the change
+# remains, "ship" otherwise (pre-existing defects never hold a change back).
+cp_change_verdict() {
+  local n
+  case "$(cp_json_tool)" in
+    python3)
+      n="$(python3 -I -c 'import json,sys; print(sum(1 for f in json.load(open(sys.argv[1])).get("findings",[]) if f.get("severity") in ("blocker","major") and f.get("origin") != "preexisting"))' "$1" 2>/dev/null)" ;;
+    jq) n="$(jq '[.findings[] | select((.severity == "blocker" or .severity == "major") and .origin != "preexisting")] | length' "$1" 2>/dev/null)" ;;
+  esac
+  case "$n" in ''|*[!0-9]*) cp_json_string verdict < "$1" || echo '?' ;; 0) echo ship ;; *) echo fix ;; esac
+}
